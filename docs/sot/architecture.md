@@ -10,7 +10,8 @@ Last Updated: 2026-01-11
 
 ## 关键约束 / 不变量
 - 数据源：仅 Pendle 官方 API v2（默认 baseUrl：`https://api-v2.pendle.finance/core`）
-- 只读：首版 tools 仅调用 GET endpoints（`/v1/chains`、`/v1/markets/all`、`/v1/assets/all`、`/v1/prices/assets`）
+- 只读：仅调用语义只读的 GET endpoints；排除所有 POST 与语义上可能触发动作的 GET（例如 cancel/redeem/swap 类）。部分 GET 会返回报价/交易参数（如 `convert`），但本项目不签名、不广播链上交易。
+- 参数约定：MCP tools 对外参数使用 snake_case；对 Pendle API 的 query/path 字段按官方命名透传（如 `chainId`、`resumeToken`、`includeFeeBreakdown`）
 - 配置入口（环境变量）：
   - `PENDLE_API_BASE_URL`
   - `PENDLE_API_TIMEOUT_SECONDS`（默认 20）
