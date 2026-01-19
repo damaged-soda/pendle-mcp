@@ -1,6 +1,6 @@
 # 项目概览（SOT）
 
-Last Updated: 2026-01-11
+Last Updated: 2026-01-19
 
 ## 项目是什么
 `pendle-mcp` 是一个 MCP Server（stdio），数据源接入 Pendle 官方 API v2（`https://api-v2.pendle.finance/core`），对外提供只读（GET）数据查询类 tools（排除 POST 与语义上可能触发动作的 GET）。
@@ -18,6 +18,12 @@ Last Updated: 2026-01-11
 - SDK（查询/报价类）：`pendle_get_supported_aggregators`、`pendle_get_market_tokens`、`pendle_get_swapping_prices`、`pendle_get_pt_cross_chain_metadata`、`pendle_convert_v2`
 - Ve Pendle：`pendle_get_ve_pendle_data_v2`、`pendle_get_ve_pendle_market_fees_chart`
 - Statistics：`pendle_get_distinct_user_from_token`
+
+## Tool 参数与错误约定（重要）
+- `ids`（如 `pendle_get_assets_all` / `pendle_get_asset_prices` / `pendle_get_markets_all`）：元素格式为 `<chainId>-<address>`（例如 `1-0x...`、`8453-0x...`）。仅传裸地址可能返回错误或空结果。
+- `pendle_convert_v2.slippage`：使用**比例小数**（例如 0.5% => `0.005`；50% => `0.5`）。
+- `pendle_convert_v2.amounts_in`：必须是输入 token **最小单位**的 base-10 **整数字符串**（例如 decimals=18 时，`0.001` => `1000000000000000`）。禁止传 `"0.001"` 这类小数。
+- 非 2xx 错误：会包含 `status_code`、请求 `url`、以及响应 `detail`（过长会截断）以便快速定位问题。
 
 ## 本地开发最小路径（只到开发自测）
 - `conda activate pendle-mcp`
