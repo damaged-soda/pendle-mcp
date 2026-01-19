@@ -6,8 +6,13 @@
 * **代码空间** (Implementation): `./src/` (禁止将代码写入 docs，反之亦然)
 * **仓库映射**: `./docmap.yaml` (单一事实源，先读再动)
 * **Git 规则**:
+<<<<<<< HEAD
 * **严禁** 执行任何 git 命令 (clone/commit/push)。
 * **必须** 在每个阶段结束时，生成建议的 git 命令代码块供用户复制执行。
+=======
+* **严禁** 直接执行任何 git 命令 (clone/commit/push)。
+* **必须** 在每个阶段结束时，生成建议的 git 命令代码块供用户审核，若同意则执行。
+>>>>>>> template_upstream/main
 
 ## 1) 目录本体论 (Directory Ontology)
 
