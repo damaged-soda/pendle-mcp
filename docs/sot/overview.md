@@ -10,6 +10,7 @@ Last Updated: 2026-01-19
 
 ## 提供的 MCP tools（按类别）
 - Chains：`pendle_get_chains`
+- Health：`pendle_health`
 - Markets：`pendle_get_markets_all`、`pendle_get_markets_points_market`、`pendle_get_market_data_v2`、`pendle_get_market_historical_data_v2`
 - Assets / Prices：`pendle_get_assets_all`、`pendle_get_asset_prices`、`pendle_get_prices_ohlcv_v4`
 - Transactions：`pendle_get_user_pnl_transactions`、`pendle_get_market_transactions_v5`
@@ -21,9 +22,13 @@ Last Updated: 2026-01-19
 
 ## Tool 参数与错误约定（重要）
 - `ids`（如 `pendle_get_assets_all` / `pendle_get_asset_prices` / `pendle_get_markets_all`）：元素格式为 `<chainId>-<address>`（例如 `1-0x...`、`8453-0x...`）。仅传裸地址可能返回错误或空结果。
-- `pendle_convert_v2.slippage`：使用**比例小数**（例如 0.5% => `0.005`；50% => `0.5`）。
+- `pendle_convert_v2.slippage`：使用**比例小数**且范围必须在 `[0, 1]`（例如 0.5% => `0.005`；50% => `0.5`）。
+- `pendle_convert_v2.tokens_in/amounts_in`：长度必须一致；`tokens_out` 不可为空。
 - `pendle_convert_v2.amounts_in`：必须是输入 token **最小单位**的 base-10 **整数字符串**（例如 decimals=18 时，`0.001` => `1000000000000000`）。禁止传 `"0.001"` 这类小数。
-- 非 2xx 错误：会包含 `status_code`、请求 `url`、以及响应 `detail`（过长会截断）以便快速定位问题。
+- `pendle_get_market_historical_data_v2.time_frame`：支持 `hour/day/week`，并接受别名 `1h/1d/1w`（会在本地自动规范化后再请求 Pendle API）。
+- `pendle_get_prices_ohlcv_v4.time_frame`：支持 `hour/day/week`，并接受别名 `1h/1d/1w`（会在本地自动规范化后再请求 Pendle API）。
+- `pendle_get_prices_ohlcv_v4.parse_results`：可选解析响应中的 `results` CSV 字符串为 `results_parsed`（结构化数组），默认 `false` 保持原样返回。
+- API 错误（含 non-2xx/网络/JSON 不合法）：会包含 `error_type/status_code/method/path/params/attempts/retries_exhausted/url/detail`；其中 `params/url` 会对敏感/超长字段（如 `additionalData`）脱敏/截断，`detail` 过长会截断（可用 `PENDLE_API_ERROR_DETAIL_MAX_CHARS` 配置上限）。
 
 ## 本地开发最小路径（只到开发自测）
 - `conda activate pendle-mcp`
