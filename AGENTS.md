@@ -1,65 +1,101 @@
-# 文档驱动 AI 编码规则（V1）
+# 文档驱动 AI 编码规则 (V2 - Hybrid OpenSpec)
 
-## 0）空间分离（必须遵守）
-- 文档（定义空间）：./docs/
-- 代码（实现空间）：./src/（每个 ./src/<repo> 可为独立 Git 仓库；禁止执行任何 git 命令）
-- 仓库映射（单一事实源）：./docmap.yaml（先读它再行动，不得猜 repo 路径）
+## 0) 空间与权限 (Space & Permissions)
 
-## 1）文档结构（目录即状态）
-- SOT（当前事实，唯一权威）：./docs/sot/
-- WIP（进行中变更）：./docs/wip/YYYYMMDD-topic/
-  - 每个 WIP 需求目录必须包含：plan.md（含检查单）
-- Archive（已完成归档）：./docs/archive/YYYYMMDD-topic/
-  - 仅在“用户验收通过 + SOT 已更新 + 检查单全勾选”后才允许移动整个 WIP 目录到此处
-- 模板：./docs/_templates/plan.md
+* **文档空间** (Definition): `./docs/`
+* **代码空间** (Implementation): `./src/` (禁止将代码写入 docs，反之亦然)
+* **仓库映射**: `./docmap.yaml` (单一事实源，先读再动)
+* **Git 规则**:
+* **严禁** 直接执行任何 git 命令 (clone/commit/push)。
+* **必须** 在每个阶段结束时，生成建议的 git 命令代码块供用户审核，若同意则执行。
 
-## 2）状态锚点（防遗忘，必须）
-- 每次回复开头必须输出“状态锚点”，格式固定如下（不省略）：
-  - WIP：<当前需求目录路径；若尚未创建则写“无”>
-  - 阶段：PLAN | IMPLEMENT | VERIFY | SOT | ARCHIVE
-  - 下一步：<一句话说明你接下来要做什么>
+## 1) 目录本体论 (Directory Ontology)
 
-## 3）会话启动默认动作（尽量静默）
-当在项目根目录启动 Codex 时，按顺序执行：
-1) 读取 ./docs/README.md
-2) 读取 ./docs/sot/index.md 及其列出的 SOT 文件
-3) 读取 ./docmap.yaml；列出可用 repo，并检查 ./src/<repo> 目录是否存在
-   - 若 repo 目录不存在：提示用户自行 clone 到 ./src/；不得执行 git
-4) 扫描 ./docs/wip/，列出当前进行中的需求目录（如有）
-5) 若对话很长或易偏航：优先通过重新读取当前 WIP 的 plan.md 来恢复上下文（必要时使用 Codex 的 /compact）,恢复后必须对照 plan.md 第 6 节检查单，确认当前阶段与下一步。
+* **SOT (真理源)**: `./docs/sot/` (当前系统的唯一权威描述)
+* **WIP (工作区)**: `./docs/wip/YYYYMMDD-<topic>/`
+* 每个 WIP 目录**必须**包含以下“三位一体”文件：
+1. `intent.md`: **意图**。背景、目标、非目标 (Why & What)。
+2. `spec_delta.md`: **规范增量**。对 SOT 的修改草案 (The Contract)。
+3. `tasks.md`: **执行清单**。原子化的步骤 Checklists (The How)。
 
 
-## 4）任何“变更请求”的强制流程
-当用户提出任何会改变行为/代码的请求时，必须按顺序执行：
+* **Archive (归档)**: `./docs/archive/YYYYMMDD-<topic>/`
 
-1) 创建需求目录：./docs/wip/YYYYMMDD-topic/
+## 2) 状态锚点 (State Anchor)
 
-2) 基于 ./docs/_templates/plan.md 创建并填写：./docs/wip/YYYYMMDD-topic/plan.md（包含检查单）
+**【强制执行】** 每次回复的**第一段**必须输出以下锚点块，不得省略：
 
-3) 请求用户审核并确认 plan.md（PLAN 闸门）
-- 未确认前不得改代码
+> ⚓ **锚点**: <当前 WIP 路径 | "无">
+> 🚦 **阶段**: PROPOSAL | IMPLEMENT | VERIFY | ARCHIVE
+> 📝 **下一步**: <一句话说明>
 
-4) 实现阶段（IMPLEMENT，必须分批确认写入）
-- 在写入任何代码/大量修改前，先输出“本批次变更计划”（将改哪些 repo/文件、做什么、影响/风险），征求用户确认后才允许写入
-- 写入只发生在 ./src/<repo>/
+## 3) 启动序列 (Boot Sequence)
 
-5) 自测与交付摘要（VERIFY，验收闸门）
-- 完成实现与基本自测后，必须输出“交付摘要”，包含：
-  - 实际改动清单（按 repo 列出关键文件/模块）
-  - 自测步骤与结果
-  - 对照 plan.md 第 3 节“通过标准”的逐条结论
-  - 已知风险/未决事项（如有必须明示）
-- 询问用户是否“验收通过，允许更新 SOT 并归档”
-- 未通过则保持 WIP，不得更新 SOT/归档，按反馈继续迭代
+当会话启动时，按顺序执行：
 
-6) 收尾关卡（FINISH GATE）与归档（SOT + ARCHIVE）
-- 仅在用户验收通过后，才允许：
-  1) 按 plan.md 第 4 节更新 ./docs/sot/*（反映当前真实实现）
-  2) 更新 plan.md 第 6 节检查单：将所有必选项勾为完成（必须全勾）
-  3) 将整个需求目录从 ./docs/wip/YYYYMMDD-topic/ 移动到 ./docs/archive/YYYYMMDD-topic/
+1. 读取 `./docs/README.md` 与 `./docs/sot/index.md`。
+2. 读取 `./docmap.yaml`，检查 `./src/` 下各仓库是否存在。
+3. 扫描 `./docs/wip/`。若存在活跃目录，读取其 `tasks.md` 和 `spec_delta.md` 恢复上下文。
+4. 若无活跃任务，进入待命状态。
 
-## 5）写入与安全闸门
-- 写入/移动文件前，先用简短列表总结计划（路径 + 意图），并征求用户确认
-- 严禁把代码写入 ./docs/；严禁把文档写入 ./src/
-- V1 默认不引入/维护部署、上线、CI/CD、runbook 等文档（除非用户明确要求）
-- 禁止执行任何 git 操作（clone/init/commit/push 等均不做）
+## 4) 事务性工作流 (Transactional Workflow)
+
+### 阶段一：提案 (PROPOSAL)
+
+当用户提出变更请求时：
+
+1. 创建目录 `./docs/wip/YYYYMMDD-<topic>/`。
+2. **生成意图 (`intent.md`)**：描述变更原因、用户故事。
+3. **生成规范增量 (`spec_delta.md`)**：
+* 模拟 OpenSpec 格式，列出 `## ADDED Requirements`, `## MODIFIED Requirements`。
+* **关键**：此时不修改 SOT，只在此文件中描述“如果不执行代码，SOT 应该变成什么样”。
+
+
+4. **生成任务 (`tasks.md`)**：基于 `spec_delta.md` 拆解代码步骤。
+5. **闸门**：请求用户审核。**未经确认，不得写一行业务代码。**
+
+### 阶段二：实施 (IMPLEMENT)
+
+仅在提案获批后进入：
+
+1. 读取 `tasks.md`，逐条执行。
+2. **原子化写入**：每次修改代码后，立即在 `tasks.md` 中打钩 `[x]`。
+3. **规范对齐**：写代码时必须反复查阅 `spec_delta.md`，确保代码行为与规范一致。
+4. **Git 建议**：每完成一个大任务节点，输出：bash
+git add. && git commit -m "feat: <task description>"
+
+### 阶段三：验证 (VERIFY)
+
+1. 执行自测。
+2. 输出**交付摘要**：
+* 修改文件清单。
+* 自测结果。
+* 对照 `intent.md` 的验收结论。
+
+
+3. **闸门**：询问用户“是否验收通过并归档？”
+
+### 阶段四：归档 (ARCHIVE)
+
+仅在用户明确输入“归档/Archive”后执行：
+
+1. **SOT 合并 (Critical)**：
+* 读取 `spec_delta.md`。
+* 将增量内容**精确地**应用到 `./docs/sot/` 下的对应文件中。
+* *注意*：这是最危险的步骤，必须先输出“SOT 变更预览”，用户确认后再写入。
+
+
+2. **清理**：将 `tasks.md` 全勾选。
+3. **移动**：`mv./docs/wip/<dir>./docs/archive/<dir>`。
+4. **Git 建议**：
+```bash
+git add./docs/
+git commit -m "chore: archive <topic> and update SOT"
+
+```
+
+## 5) 安全守则 (Safety Protocol)
+
+1. **禁止盲写**：不知晓 `docmap.yaml` 定义的路径前，不得猜测文件位置。
+2. **SOT 神圣性**：在 PROPOSAL 和 IMPLEMENT 阶段，**严禁修改** `./docs/sot/` 下的任何文件。SOT 的更新仅允许发生在 ARCHIVE 阶段。
+3. **双重检查**：若用户指令与 `spec_delta.md` 冲突，必须先更新 Spec，再改代码。
