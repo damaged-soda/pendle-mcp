@@ -58,18 +58,27 @@ async def pendle_get_markets_all(
     chain_id: int | None = None,
     ids: list[str] | None = None,
     is_active: bool | None = None,
+    order_by: str | None = None,
+    skip: int | None = None,
+    limit: int | None = None,
 ) -> Any:
-    """Get whitelisted markets list with metadata across chains. (GET /v1/markets/all)
+    """Get whitelisted markets list with metadata across chains. (GET /v2/markets/all)
+
+    Returns a paginated response: `{total, limit, skip, results: [...]}`.
 
     Notes:
     - `ids` items should be market IDs in the form `<chainId>-<address>` (e.g. `1-0x...`,
       `8453-0x...`). Passing a raw address may return an error or empty results.
+    - Default API page size is 20; use `skip` and `limit` to page through `total`.
     """
     async with PendleApiClient.from_env() as client:
         return await client.get_markets_all(
             chain_id=chain_id,
             ids=ids,
             is_active=is_active,
+            order_by=order_by,
+            skip=skip,
+            limit=limit,
         )
 
 
@@ -104,7 +113,7 @@ async def pendle_get_market_data_v2(
 
 
 @mcp.tool()
-async def pendle_get_market_historical_data_v2(
+async def pendle_get_market_historical_data_v3(
     *,
     chain_id: int,
     address: str,
@@ -113,14 +122,16 @@ async def pendle_get_market_historical_data_v2(
     timestamp_end: str | None = None,
     fields: list[str] | None = None,
     include_fee_breakdown: bool | None = None,
+    include_apy_breakdown: bool | None = None,
 ) -> Any:
-    """Get market time-series data by address. (GET /v2/{chainId}/markets/{address}/historical-data)
+    """Get market time-series data by address. (GET /v3/{chainId}/markets/{address}/historical-data)
 
     Notes:
     - `time_frame` accepts `hour`/`day`/`week` and aliases `1h`/`1d`/`1w` (auto-normalized before request).
+    - `include_apy_breakdown` (v3 only) attaches APY breakdown sub-fields to the response.
     """
     async with PendleApiClient.from_env() as client:
-        return await client.get_market_historical_data_v2(
+        return await client.get_market_historical_data_v3(
             chain_id=chain_id,
             address=address,
             time_frame=time_frame,
@@ -128,6 +139,7 @@ async def pendle_get_market_historical_data_v2(
             timestamp_end=timestamp_end,
             fields=fields,
             include_fee_breakdown=include_fee_breakdown,
+            include_apy_breakdown=include_apy_breakdown,
         )
 
 
@@ -296,10 +308,36 @@ async def pendle_get_user_positions(
 
 
 @mcp.tool()
-async def pendle_get_merkle_claimed_rewards(*, user: str) -> Any:
-    """Get all merkle claimed rewards for a user. (GET /v1/dashboard/merkle-claimed-rewards/{user})"""
+async def pendle_get_merkle_rewards(*, user: str) -> Any:
+    """Get pending and claimed merkle rewards for a user. (GET /v1/dashboard/merkle-rewards/{user})
+
+    Returns `{claimableRewards, claimedRewards}`: claimable items are not yet claimed,
+    claimed items are historical records.
+    """
     async with PendleApiClient.from_env() as client:
-        return await client.get_merkle_claimed_rewards(user=user)
+        return await client.get_merkle_rewards(user=user)
+
+
+@mcp.tool()
+async def pendle_get_spendle_data() -> Any:
+    """Get aggregate sPENDLE staking data. (GET /v1/spendle/data)
+
+    Returns total PENDLE staked, last-epoch APR, buyback amount, and historical breakdowns
+    spanning sPENDLE and legacy vePENDLE positions over the last 12 epochs.
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.get_spendle_data()
+
+
+@mcp.tool()
+async def pendle_get_user_pnl_gained_positions(*, user: str) -> Any:
+    """Get a user's gained PnL across all market positions. (GET /v1/pnl/gained/{user}/positions)
+
+    Returns `{total, positions}`: each position carries net gain, total spent, max capital,
+    trading volume, and unclaimed rewards.
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.get_user_pnl_gained_positions(user=user)
 
 
 @mcp.tool()
@@ -559,6 +597,7 @@ async def pendle_health(
         checks: dict[str, Any] = {
             "v1/chains": client.get_chains(),
             "v2/ve-pendle/data": client.get_ve_pendle_data_v2(),
+            "v1/spendle/data": client.get_spendle_data(),
         }
 
         if chain_id is not None and market_address is not None:
@@ -571,7 +610,7 @@ async def pendle_health(
             checks["v1/sdk/markets/swapping-prices"] = client.get_swapping_prices(
                 chain_id=chain_id, market=market_address
             )
-            checks["v2/markets/historical-data"] = client.get_market_historical_data_v2(
+            checks["v3/markets/historical-data"] = client.get_market_historical_data_v3(
                 chain_id=chain_id,
                 address=market_address,
                 time_frame=time_frame,

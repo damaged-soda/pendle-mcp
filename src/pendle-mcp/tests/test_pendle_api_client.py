@@ -166,11 +166,17 @@ async def test_from_env_reads_error_detail_max_chars(
 @pytest.mark.asyncio
 async def test_get_markets_all_query_params() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/core/v1/markets/all"
+        assert request.url.path == "/core/v2/markets/all"
         assert request.url.params.get("chainId") == "42161"
         assert request.url.params.get("isActive") == "true"
         assert request.url.params.get("ids") == "m1,m2"
-        return httpx.Response(200, json={"results": []})
+        assert request.url.params.get("order_by") == "name:asc"
+        assert request.url.params.get("skip") == "20"
+        assert request.url.params.get("limit") == "50"
+        return httpx.Response(
+            200,
+            json={"total": 100, "limit": 50, "skip": 20, "results": []},
+        )
 
     transport = httpx.MockTransport(handler)
     async with PendleApiClient(
@@ -180,9 +186,12 @@ async def test_get_markets_all_query_params() -> None:
             chain_id=42161,
             ids=["m1", "m2"],
             is_active=True,
+            order_by="name:asc",
+            skip=20,
+            limit=50,
         )
 
-    assert data == {"results": []}
+    assert data == {"total": 100, "limit": 50, "skip": 20, "results": []}
 
 
 @pytest.mark.asyncio
@@ -273,21 +282,22 @@ async def test_get_market_data_v2_query_params() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_market_historical_data_v2_query_params() -> None:
+async def test_get_market_historical_data_v3_query_params() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/core/v2/42161/markets/0xmarket/historical-data"
+        assert request.url.path == "/core/v3/42161/markets/0xmarket/historical-data"
         assert request.url.params.get("time_frame") == "day"
         assert request.url.params.get("timestamp_start") == "2026-01-01T00:00:00Z"
         assert request.url.params.get("timestamp_end") == "2026-01-11T00:00:00Z"
         assert request.url.params.get("fields") == "ptApy,ytApy"
         assert request.url.params.get("includeFeeBreakdown") == "true"
+        assert request.url.params.get("includeApyBreakdown") == "true"
         return httpx.Response(200, json={"rows": []})
 
     transport = httpx.MockTransport(handler)
     async with PendleApiClient(
         base_url="https://api-v2.pendle.finance/core", transport=transport
     ) as client:
-        data = await client.get_market_historical_data_v2(
+        data = await client.get_market_historical_data_v3(
             chain_id=42161,
             address="0xmarket",
             time_frame="1d",
@@ -295,6 +305,7 @@ async def test_get_market_historical_data_v2_query_params() -> None:
             timestamp_end="2026-01-11T00:00:00Z",
             fields=["ptApy", "ytApy"],
             include_fee_breakdown=True,
+            include_apy_breakdown=True,
         )
 
     assert data == {"rows": []}
@@ -424,18 +435,52 @@ async def test_get_user_positions_query_params() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_merkle_claimed_rewards_path() -> None:
+async def test_get_merkle_rewards_path() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/core/v1/dashboard/merkle-claimed-rewards/0xuser"
-        return httpx.Response(200, json={"rewards": []})
+        assert request.url.path == "/core/v1/dashboard/merkle-rewards/0xuser"
+        return httpx.Response(
+            200,
+            json={"claimableRewards": [], "claimedRewards": []},
+        )
 
     transport = httpx.MockTransport(handler)
     async with PendleApiClient(
         base_url="https://api-v2.pendle.finance/core", transport=transport
     ) as client:
-        data = await client.get_merkle_claimed_rewards(user="0xuser")
+        data = await client.get_merkle_rewards(user="0xuser")
 
-    assert data == {"rewards": []}
+    assert data == {"claimableRewards": [], "claimedRewards": []}
+
+
+@pytest.mark.asyncio
+async def test_get_spendle_data_path() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/core/v1/spendle/data"
+        assert dict(request.url.params) == {}
+        return httpx.Response(200, json={"totalPendleStaked": "0"})
+
+    transport = httpx.MockTransport(handler)
+    async with PendleApiClient(
+        base_url="https://api-v2.pendle.finance/core", transport=transport
+    ) as client:
+        data = await client.get_spendle_data()
+
+    assert data == {"totalPendleStaked": "0"}
+
+
+@pytest.mark.asyncio
+async def test_get_user_pnl_gained_positions_path() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/core/v1/pnl/gained/0xuser/positions"
+        return httpx.Response(200, json={"total": 0, "positions": []})
+
+    transport = httpx.MockTransport(handler)
+    async with PendleApiClient(
+        base_url="https://api-v2.pendle.finance/core", transport=transport
+    ) as client:
+        data = await client.get_user_pnl_gained_positions(user="0xuser")
+
+    assert data == {"total": 0, "positions": []}
 
 
 @pytest.mark.asyncio
