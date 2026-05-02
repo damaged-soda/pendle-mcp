@@ -16,6 +16,27 @@ python -m pendle_mcp   # stdio 运行
 
 代码入口：`src/pendle-mcp/src/pendle_mcp/`。
 
+## 命令行（live 测试）
+
+`pendle-mcp-cli` 直接调 tool 函数走真实 Pendle API，不经 MCP 客户端 —— 用来在改 server 代码后**不重启 Claude Code** 就能验证。
+
+```bash
+pendle-mcp-cli list                          # 列出所有 tool
+pendle-mcp-cli show pendle_convert_v2        # 看签名 + docstring
+pendle-mcp-cli call pendle_health --json '{}'
+pendle-mcp-cli call pendle_convert_v2 --json '{
+  "chain_id": 1,
+  "slippage": 0.005,
+  "tokens_in":  ["0xcbc72d92b2dc8187414f6734718563898740c0bc"],
+  "amounts_in": ["1000000000000000000"],
+  "tokens_out": ["0xb253eff1104802b97ac7e3ac9fdd73aece295a2c"],
+  "enable_aggregator": true
+}'
+echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdin 读
+```
+
+成功输出 stdout 是格式化 JSON；`PendleApiError` 走 stdout 之外，结构化打到 stderr 并以非零退出码返回。覆盖范围：tool 函数 + 参数校验 + API 客户端 + 响应后处理 —— 唯一**没**测的是 FastMCP 的传输层（参数解析 / 响应序列化），那一层有传输回归时再用 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) 验。
+
 ## 模块结构
 
 - `pendle_mcp.server` —— FastMCP server（stdio）与 tools 定义
