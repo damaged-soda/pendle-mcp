@@ -1,0 +1,603 @@
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
+import time
+from typing import Any, Mapping
+
+from pendle_mcp.pendle_api import (
+    PendleApiClient,
+    PendleApiError,
+    PendleAssetType,
+    TransactionAction,
+    TransactionType,
+)
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception as e:
+    raise RuntimeError(
+        "MCP Python SDK is required; install dependencies (e.g. `pip install -e \".[dev]\"`)."
+    ) from e
+
+mcp = FastMCP("pendle-mcp")
+
+_OHLCV_RESULT_KEYS = ("time", "open", "high", "low", "close", "volume")
+
+
+def _parse_ohlcv_results_csv(results: str) -> list[dict[str, str]]:
+    reader = csv.reader(io.StringIO(results))
+    rows: list[dict[str, str]] = []
+    header_skipped = False
+    for row_index, row in enumerate(reader):
+        normalized = [value.strip() for value in row]
+        if not any(normalized):
+            continue
+        if not header_skipped and normalized and normalized[0].lower() in {"time", "timestamp"}:
+            header_skipped = True
+            continue
+        if len(normalized) != len(_OHLCV_RESULT_KEYS):
+            raise ValueError(
+                f"Expected {len(_OHLCV_RESULT_KEYS)} columns but got {len(normalized)} at row {row_index}."
+            )
+        rows.append(dict(zip(_OHLCV_RESULT_KEYS, normalized, strict=True)))
+    return rows
+
+
+@mcp.tool()
+async def pendle_get_chains() -> Any:
+    """Get supported chain IDs. (GET /v1/chains)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_chains()
+
+
+@mcp.tool()
+async def pendle_get_markets_all(
+    *,
+    chain_id: int | None = None,
+    ids: list[str] | None = None,
+    is_active: bool | None = None,
+) -> Any:
+    """Get whitelisted markets list with metadata across chains. (GET /v1/markets/all)
+
+    Notes:
+    - `ids` items should be market IDs in the form `<chainId>-<address>` (e.g. `1-0x...`,
+      `8453-0x...`). Passing a raw address may return an error or empty results.
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.get_markets_all(
+            chain_id=chain_id,
+            ids=ids,
+            is_active=is_active,
+        )
+
+
+@mcp.tool()
+async def pendle_get_markets_points_market(
+    *,
+    chain_id: int | None = None,
+    is_active: bool | None = None,
+) -> Any:
+    """Get points market. (GET /v1/markets/points-market)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_markets_points_market(
+            chain_id=chain_id,
+            is_active=is_active,
+        )
+
+
+@mcp.tool()
+async def pendle_get_market_data_v2(
+    *,
+    chain_id: int,
+    address: str,
+    timestamp: str | None = None,
+) -> Any:
+    """Get latest/historical market data by address. (GET /v2/{chainId}/markets/{address}/data)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_market_data_v2(
+            chain_id=chain_id,
+            address=address,
+            timestamp=timestamp,
+        )
+
+
+@mcp.tool()
+async def pendle_get_market_historical_data_v2(
+    *,
+    chain_id: int,
+    address: str,
+    time_frame: str | None = None,
+    timestamp_start: str | None = None,
+    timestamp_end: str | None = None,
+    fields: list[str] | None = None,
+    include_fee_breakdown: bool | None = None,
+) -> Any:
+    """Get market time-series data by address. (GET /v2/{chainId}/markets/{address}/historical-data)
+
+    Notes:
+    - `time_frame` accepts `hour`/`day`/`week` and aliases `1h`/`1d`/`1w` (auto-normalized before request).
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.get_market_historical_data_v2(
+            chain_id=chain_id,
+            address=address,
+            time_frame=time_frame,
+            timestamp_start=timestamp_start,
+            timestamp_end=timestamp_end,
+            fields=fields,
+            include_fee_breakdown=include_fee_breakdown,
+        )
+
+
+@mcp.tool()
+async def pendle_get_assets_all(
+    *,
+    ids: list[str] | None = None,
+    chain_id: int | None = None,
+    skip: int | None = None,
+    limit: int | None = None,
+    asset_type: PendleAssetType | None = None,
+) -> Any:
+    """Get supported PT/YT/LP/SY assets metadata. (GET /v1/assets/all)
+
+    Notes:
+    - `ids` items should be asset IDs in the form `<chainId>-<address>` (e.g. `1-0x...`,
+      `8453-0x...`). Passing a raw address may return an error or empty results.
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.get_assets_all(
+            ids=ids,
+            chain_id=chain_id,
+            skip=skip,
+            limit=limit,
+            asset_type=asset_type,
+        )
+
+
+@mcp.tool()
+async def pendle_get_asset_prices(
+    *,
+    ids: list[str] | None = None,
+    chain_id: int | None = None,
+    skip: int | None = None,
+    limit: int | None = None,
+    asset_type: PendleAssetType | None = None,
+) -> Any:
+    """Get USD prices for assets. (GET /v1/prices/assets)
+
+    Notes:
+    - `ids` items should be asset IDs in the form `<chainId>-<address>` (e.g. `1-0x...`,
+      `8453-0x...`). Passing a raw address may return an error or empty results.
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.get_asset_prices(
+            ids=ids,
+            chain_id=chain_id,
+            skip=skip,
+            limit=limit,
+            asset_type=asset_type,
+        )
+
+
+@mcp.tool()
+async def pendle_get_prices_ohlcv_v4(
+    *,
+    chain_id: int,
+    address: str,
+    time_frame: str | None = None,
+    timestamp_start: str | None = None,
+    timestamp_end: str | None = None,
+    parse_results: bool = False,
+) -> Any:
+    """Get PT / YT / LP historical price by address. (GET /v4/{chainId}/prices/{address}/ohlcv)
+
+    Notes:
+    - `time_frame` accepts `hour`/`day`/`week` and aliases `1h`/`1d`/`1w` (auto-normalized before request).
+    - If `parse_results=true` and response has `results` as a CSV string, returns `results_parsed` as an array of
+      `{time, open, high, low, close, volume}` string fields (keeps original `results` unchanged).
+    """
+    async with PendleApiClient.from_env() as client:
+        data = await client.get_prices_ohlcv_v4(
+            chain_id=chain_id,
+            address=address,
+            time_frame=time_frame,
+            timestamp_start=timestamp_start,
+            timestamp_end=timestamp_end,
+        )
+        if not parse_results:
+            return data
+
+        if not isinstance(data, Mapping):
+            return {
+                "raw": data,
+                "results_parsed": None,
+                "parse_error": "Unexpected response type; expected object.",
+            }
+
+        results = data.get("results")
+        if not isinstance(results, str):
+            return {
+                **data,
+                "results_parsed": None,
+                "parse_error": "Response missing 'results' CSV string.",
+            }
+
+        try:
+            parsed = _parse_ohlcv_results_csv(results)
+        except Exception as e:
+            return {
+                **data,
+                "results_parsed": None,
+                "parse_error": f"{type(e).__name__}: {e}",
+            }
+
+        return {**data, "results_parsed": parsed, "parse_error": None}
+
+
+@mcp.tool()
+async def pendle_get_user_pnl_transactions(
+    *,
+    user: str,
+    skip: int | None = None,
+    limit: int | None = None,
+    chain_id: int | None = None,
+    market: str | None = None,
+) -> Any:
+    """Get user transaction by address. (GET /v1/pnl/transactions)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_user_pnl_transactions(
+            user=user,
+            skip=skip,
+            limit=limit,
+            chain_id=chain_id,
+            market=market,
+        )
+
+
+@mcp.tool()
+async def pendle_get_market_transactions_v5(
+    *,
+    chain_id: int,
+    address: str,
+    transaction_type: TransactionType | None = None,
+    min_value: float | None = None,
+    tx_origin: str | None = None,
+    action: TransactionAction | None = None,
+    resume_token: str | None = None,
+    limit: int | None = None,
+    skip: int | None = None,
+) -> Any:
+    """Get market transactions by address. (GET /v5/{chainId}/transactions/{address})"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_market_transactions_v5(
+            chain_id=chain_id,
+            address=address,
+            transaction_type=transaction_type,
+            min_value=min_value,
+            tx_origin=tx_origin,
+            action=action,
+            resume_token=resume_token,
+            limit=limit,
+            skip=skip,
+        )
+
+
+@mcp.tool()
+async def pendle_get_user_positions(
+    *,
+    user: str,
+    filter_usd: float | None = None,
+) -> Any:
+    """Get user positions by address. (GET /v1/dashboard/positions/database/{user})"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_user_positions(user=user, filter_usd=filter_usd)
+
+
+@mcp.tool()
+async def pendle_get_merkle_claimed_rewards(*, user: str) -> Any:
+    """Get all merkle claimed rewards for a user. (GET /v1/dashboard/merkle-claimed-rewards/{user})"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_merkle_claimed_rewards(user=user)
+
+
+@mcp.tool()
+async def pendle_get_limit_orders_all_v2(
+    *,
+    chain_id: int | None = None,
+    limit: int | None = None,
+    maker: str | None = None,
+    yt: str | None = None,
+    timestamp_start: str | None = None,
+    timestamp_end: str | None = None,
+    resume_token: str | None = None,
+) -> Any:
+    """Get all limit orders for analytics. (GET /v2/limit-orders)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_limit_orders_all_v2(
+            chain_id=chain_id,
+            limit=limit,
+            maker=maker,
+            yt=yt,
+            timestamp_start=timestamp_start,
+            timestamp_end=timestamp_end,
+            resume_token=resume_token,
+        )
+
+
+@mcp.tool()
+async def pendle_get_limit_orders_archived_v2(
+    *,
+    chain_id: int | None = None,
+    limit: int | None = None,
+    maker: str | None = None,
+    yt: str | None = None,
+    timestamp_start: str | None = None,
+    timestamp_end: str | None = None,
+    resume_token: str | None = None,
+) -> Any:
+    """Get all archived limit orders for analytics. (GET /v2/limit-orders/archived)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_limit_orders_archived_v2(
+            chain_id=chain_id,
+            limit=limit,
+            maker=maker,
+            yt=yt,
+            timestamp_start=timestamp_start,
+            timestamp_end=timestamp_end,
+            resume_token=resume_token,
+        )
+
+
+@mcp.tool()
+async def pendle_get_limit_orders_book_v2(
+    *,
+    chain_id: int,
+    precision_decimal: int,
+    market: str,
+    limit: int | None = None,
+    include_amm: bool | None = None,
+) -> Any:
+    """Get order book v2. (GET /v2/limit-orders/book/{chainId})"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_limit_orders_book_v2(
+            chain_id=chain_id,
+            precision_decimal=precision_decimal,
+            market=market,
+            limit=limit,
+            include_amm=include_amm,
+        )
+
+
+@mcp.tool()
+async def pendle_get_limit_orders_maker_limit_orders(
+    *,
+    chain_id: int,
+    maker: str,
+    skip: int | None = None,
+    limit: int | None = None,
+    yt: str | None = None,
+    order_type: int | None = None,
+    is_active: bool | None = None,
+) -> Any:
+    """Get user limit orders in market. (GET /v1/limit-orders/makers/limit-orders)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_limit_orders_maker_limit_orders(
+            chain_id=chain_id,
+            maker=maker,
+            skip=skip,
+            limit=limit,
+            yt=yt,
+            order_type=order_type,
+            is_active=is_active,
+        )
+
+
+@mcp.tool()
+async def pendle_get_limit_orders_taker_limit_orders(
+    *,
+    chain_id: int,
+    yt: str,
+    order_type: int,
+    skip: int | None = None,
+    limit: int | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
+) -> Any:
+    """Get limit orders to match by YT address. (GET /v1/limit-orders/takers/limit-orders)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_limit_orders_taker_limit_orders(
+            chain_id=chain_id,
+            yt=yt,
+            order_type=order_type,
+            skip=skip,
+            limit=limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+
+
+@mcp.tool()
+async def pendle_get_supported_aggregators(*, chain_id: int) -> Any:
+    """Get supported aggregators for a chain. (GET /v1/sdk/{chainId}/supported-aggregators)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_supported_aggregators(chain_id=chain_id)
+
+
+@mcp.tool()
+async def pendle_get_market_tokens(*, chain_id: int, market: str) -> Any:
+    """Get supported tokens for market. (GET /v1/sdk/{chainId}/markets/{market}/tokens)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_market_tokens(chain_id=chain_id, market=market)
+
+
+@mcp.tool()
+async def pendle_get_swapping_prices(*, chain_id: int, market: str) -> Any:
+    """Get real-time PT/YT swap price of a market. (GET /v1/sdk/{chainId}/markets/{market}/swapping-prices)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_swapping_prices(chain_id=chain_id, market=market)
+
+
+@mcp.tool()
+async def pendle_get_pt_cross_chain_metadata(*, chain_id: int, pt: str) -> Any:
+    """PT cross-chain metadata. (GET /v1/sdk/{chainId}/cross-chain-pt-metadata/{pt})"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_pt_cross_chain_metadata(chain_id=chain_id, pt=pt)
+
+
+@mcp.tool()
+async def pendle_convert_v2(
+    *,
+    chain_id: int,
+    slippage: float,
+    tokens_in: list[str],
+    amounts_in: list[str],
+    tokens_out: list[str],
+    receiver: str | None = None,
+    enable_aggregator: bool | None = None,
+    aggregators: list[str] | None = None,
+    redeem_rewards: bool | None = None,
+    need_scale: bool | None = None,
+    additional_data: str | None = None,
+    use_limit_order: bool | None = None,
+) -> Any:
+    """Universal convert function. (GET /v2/sdk/{chainId}/convert)
+
+    Parameter semantics:
+    - `slippage` is a fraction (e.g. 0.5% -> 0.005; 50% -> 0.5).
+    - `amounts_in` MUST be base-10 integer strings in the input token's smallest unit (e.g. wei).
+      Do not pass decimals like `"0.001"`.
+      Example (decimals=18): `0.001 * 10**18 = 1000000000000000` => `"1000000000000000"`.
+    - `need_scale` is forwarded to the Pendle API. It does NOT auto-convert human-readable decimals
+      in `amounts_in` to smallest-unit integers.
+    """
+    async with PendleApiClient.from_env() as client:
+        return await client.convert_v2(
+            chain_id=chain_id,
+            slippage=slippage,
+            tokens_in=tokens_in,
+            amounts_in=amounts_in,
+            tokens_out=tokens_out,
+            receiver=receiver,
+            enable_aggregator=enable_aggregator,
+            aggregators=aggregators,
+            redeem_rewards=redeem_rewards,
+            need_scale=need_scale,
+            additional_data=additional_data,
+            use_limit_order=use_limit_order,
+        )
+
+
+@mcp.tool()
+async def pendle_get_ve_pendle_data_v2() -> Any:
+    """Get vePENDLE data. (GET /v2/ve-pendle/data)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_ve_pendle_data_v2()
+
+
+@mcp.tool()
+async def pendle_get_ve_pendle_market_fees_chart(
+    *,
+    timestamp_start: str | None = None,
+    timestamp_end: str | None = None,
+) -> Any:
+    """Get vePENDLE market fees chart. (GET /v1/ve-pendle/market-fees-chart)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_ve_pendle_market_fees_chart(
+            timestamp_start=timestamp_start,
+            timestamp_end=timestamp_end,
+        )
+
+
+@mcp.tool()
+async def pendle_get_distinct_user_from_token(
+    *,
+    token: str,
+    chain_id: int | None = None,
+) -> Any:
+    """Get distinct user count from token. (GET /v1/statistics/get-distinct-user-from-token)"""
+    async with PendleApiClient.from_env() as client:
+        return await client.get_distinct_user_from_token(
+            token=token,
+            chain_id=chain_id,
+        )
+
+
+@mcp.tool()
+async def pendle_health(
+    *,
+    chain_id: int | None = None,
+    market_address: str | None = None,
+    asset_address: str | None = None,
+    time_frame: str | None = None,
+    timestamp_start: str | None = None,
+    timestamp_end: str | None = None,
+) -> Any:
+    """Health check Pendle API endpoints and show degraded status.
+
+    By default, checks only endpoints that do not require parameters. Provide `chain_id` and
+    addresses to check market/price endpoints as well.
+    """
+
+    async def run_check(name: str, coro: Any) -> dict[str, Any]:
+        start = time.perf_counter()
+        try:
+            await coro
+            ok = True
+            error: str | None = None
+        except PendleApiError as e:
+            ok = False
+            error = e.summary()
+        except Exception as e:  # pragma: no cover - defensive
+            ok = False
+            error = f"{type(e).__name__}: {e}"
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return {"name": name, "ok": ok, "latency_ms": latency_ms, "error": error}
+
+    async with PendleApiClient.from_env() as client:
+        checks: dict[str, Any] = {
+            "v1/chains": client.get_chains(),
+            "v2/ve-pendle/data": client.get_ve_pendle_data_v2(),
+        }
+
+        if chain_id is not None and market_address is not None:
+            checks["v2/markets/data"] = client.get_market_data_v2(
+                chain_id=chain_id, address=market_address
+            )
+            checks["v1/sdk/markets/tokens"] = client.get_market_tokens(
+                chain_id=chain_id, market=market_address
+            )
+            checks["v1/sdk/markets/swapping-prices"] = client.get_swapping_prices(
+                chain_id=chain_id, market=market_address
+            )
+            checks["v2/markets/historical-data"] = client.get_market_historical_data_v2(
+                chain_id=chain_id,
+                address=market_address,
+                time_frame=time_frame,
+                timestamp_start=timestamp_start,
+                timestamp_end=timestamp_end,
+            )
+
+        if chain_id is not None and asset_address is not None:
+            checks["v4/prices/ohlcv"] = client.get_prices_ohlcv_v4(
+                chain_id=chain_id,
+                address=asset_address,
+                time_frame=time_frame,
+                timestamp_start=timestamp_start,
+                timestamp_end=timestamp_end,
+            )
+
+        results = await asyncio.gather(
+            *(run_check(name, coro) for name, coro in checks.items())
+        )
+
+        results.sort(key=lambda item: item["name"])
+        return {
+            "checks": results,
+            "base_url": str(client._client.base_url),
+        }
+
+
+def run() -> None:
+    mcp.run()
