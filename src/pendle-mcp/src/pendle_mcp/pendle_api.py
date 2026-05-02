@@ -461,6 +461,9 @@ class PendleApiClient:
         chain_id: int | None = None,
         ids: list[str] | None = None,
         is_active: bool | None = None,
+        order_by: str | None = None,
+        skip: int | None = None,
+        limit: int | None = None,
     ) -> Any:
         params: dict[str, Any] = {}
         if is_active is not None:
@@ -469,7 +472,13 @@ class PendleApiClient:
             params["chainId"] = chain_id
         if ids:
             params["ids"] = _encode_ids(ids)
-        return await self.get_json("/v1/markets/all", params=params or None)
+        if order_by is not None:
+            params["order_by"] = order_by
+        if skip is not None:
+            params["skip"] = skip
+        if limit is not None:
+            params["limit"] = limit
+        return await self.get_json("/v2/markets/all", params=params or None)
 
     async def get_markets_points_market(
         self,
@@ -499,7 +508,7 @@ class PendleApiClient:
             params=params or None,
         )
 
-    async def get_market_historical_data_v2(
+    async def get_market_historical_data_v3(
         self,
         *,
         chain_id: int,
@@ -509,6 +518,7 @@ class PendleApiClient:
         timestamp_end: str | None = None,
         fields: list[str] | None = None,
         include_fee_breakdown: bool | None = None,
+        include_apy_breakdown: bool | None = None,
     ) -> Any:
         params: dict[str, Any] = {}
         normalized_time_frame = _normalize_time_frame(time_frame)
@@ -522,8 +532,10 @@ class PendleApiClient:
             params["fields"] = _encode_csv(fields)
         if include_fee_breakdown is not None:
             params["includeFeeBreakdown"] = _encode_bool(include_fee_breakdown)
+        if include_apy_breakdown is not None:
+            params["includeApyBreakdown"] = _encode_bool(include_apy_breakdown)
         return await self.get_json(
-            f"/v2/{chain_id}/markets/{address}/historical-data",
+            f"/v3/{chain_id}/markets/{address}/historical-data",
             params=params or None,
         )
 
@@ -660,12 +672,22 @@ class PendleApiClient:
             params=params or None,
         )
 
-    async def get_merkle_claimed_rewards(
+    async def get_merkle_rewards(
         self,
         *,
         user: str,
     ) -> Any:
-        return await self.get_json(f"/v1/dashboard/merkle-claimed-rewards/{user}")
+        return await self.get_json(f"/v1/dashboard/merkle-rewards/{user}")
+
+    async def get_spendle_data(self) -> Any:
+        return await self.get_json("/v1/spendle/data")
+
+    async def get_user_pnl_gained_positions(
+        self,
+        *,
+        user: str,
+    ) -> Any:
+        return await self.get_json(f"/v1/pnl/gained/{user}/positions")
 
     async def get_limit_orders_all_v2(
         self,
