@@ -83,8 +83,9 @@ API 错误统一返回 `PendleApiError`，字段：`error_type / status_code / m
 |------|------|------|
 | `PENDLE_API_BASE_URL` | `https://api-v2.pendle.finance/core` | API base URL |
 | `PENDLE_API_TIMEOUT_SECONDS` | `20` | 单次请求超时 |
-| `PENDLE_API_MAX_RETRIES` | `1` | 对网络错误 / 5xx / 429 的最大重试次数；429 支持 `Retry-After` |
+| `PENDLE_API_MAX_RETRIES` | `3` | 对网络错误 / 5xx / 429 的最大重试次数；429 支持 `Retry-After` |
 | `PENDLE_API_RETRY_BACKOFF_SECONDS` | `0.2` | 指数退避基数 + jitter |
+| `PENDLE_API_MAX_CONCURRENCY` | `4` | 进程级出站并发上限。所有 `PendleApiClient` 共享一个 `asyncio.Semaphore`，槽位贯穿整个重试循环（包括 backoff sleep）—— 给 Pendle 真正的 cooldown 喘息，避免 inflight 互相 barge 重新触发 429。设大数字（如 `1000`）等于关闭。 |
 | `PENDLE_API_ERROR_DETAIL_MAX_CHARS` | `2048` | 错误 `detail` 字段截断上限 |
 
 ## 命名约定

@@ -14,10 +14,52 @@ import httpx
 
 DEFAULT_PENDLE_API_BASE_URL = "https://api-v2.pendle.finance/core"
 DEFAULT_PENDLE_API_TIMEOUT_SECONDS = 20.0
-DEFAULT_PENDLE_API_MAX_RETRIES = 1
+DEFAULT_PENDLE_API_MAX_RETRIES = 3
 DEFAULT_PENDLE_API_RETRY_BACKOFF_SECONDS = 0.2
 DEFAULT_PENDLE_API_RETRY_JITTER_RATIO = 0.1
 DEFAULT_PENDLE_API_ERROR_DETAIL_MAX_CHARS = 2048
+DEFAULT_PENDLE_API_MAX_CONCURRENCY = 4
+
+
+_global_semaphore: asyncio.Semaphore | None = None
+_global_semaphore_loop_id: int | None = None
+
+
+def _read_env_concurrency_limit() -> int:
+    raw = os.getenv(
+        "PENDLE_API_MAX_CONCURRENCY",
+        str(DEFAULT_PENDLE_API_MAX_CONCURRENCY),
+    ).strip()
+    try:
+        n = int(raw)
+    except ValueError as e:
+        raise ValueError("PENDLE_API_MAX_CONCURRENCY must be an integer") from e
+    if n < 1:
+        raise ValueError("PENDLE_API_MAX_CONCURRENCY must be >= 1")
+    return n
+
+
+def _get_concurrency_semaphore() -> asyncio.Semaphore:
+    """Process-wide outbound concurrency limiter, shared across all
+    PendleApiClient instances on the same event loop. Held across the entire
+    retry loop so backoff sleeps don't release the slot — that gives Pendle a
+    real cooldown breath instead of letting other inflight requests barge in
+    and re-trigger 429.
+    """
+    global _global_semaphore, _global_semaphore_loop_id
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    if _global_semaphore is None or _global_semaphore_loop_id != loop_id:
+        _global_semaphore = asyncio.Semaphore(_read_env_concurrency_limit())
+        _global_semaphore_loop_id = loop_id
+    return _global_semaphore
+
+
+def _reset_global_concurrency_state() -> None:
+    """Reset the module-level semaphore. For tests only."""
+    global _global_semaphore, _global_semaphore_loop_id
+    _global_semaphore = None
+    _global_semaphore_loop_id = None
 
 
 class PendleAssetType(str, Enum):
@@ -364,6 +406,12 @@ class PendleApiClient:
         self, path: str, *, params: Mapping[str, Any] | None = None
     ) -> Any:
         _validate_relative_path(path)
+        async with _get_concurrency_semaphore():
+            return await self._get_json_with_retries(path, params=params)
+
+    async def _get_json_with_retries(
+        self, path: str, *, params: Mapping[str, Any] | None
+    ) -> Any:
         sanitized_params = _sanitize_params(params)
 
         for attempt in range(self._max_retries + 1):
