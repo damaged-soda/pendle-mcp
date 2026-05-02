@@ -25,6 +25,111 @@ mcp = FastMCP("pendle-mcp")
 
 _OHLCV_RESULT_KEYS = ("time", "open", "high", "low", "close", "volume")
 
+_PNL_GROUP_BY_ALLOWED = {"action", "tx_hash"}
+_PNL_DEFAULT_PAGE_SIZE = 100
+_PNL_DEFAULT_MAX_PAGES = 20
+
+
+def _coerce_float(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+def _flatten_pnl_row(row: Mapping[str, Any]) -> dict[str, float]:
+    pt_spent = (row.get("ptData") or {}).get("spent_v2") or {}
+    yt_spent = (row.get("ytData") or {}).get("spent_v2") or {}
+    lp_spent = (row.get("lpData") or {}).get("spent_v2") or {}
+    profit = row.get("profit") or {}
+    return {
+        "spentUsd": _coerce_float(pt_spent.get("usd"))
+        + _coerce_float(yt_spent.get("usd"))
+        + _coerce_float(lp_spent.get("usd")),
+        "spentAsset": _coerce_float(pt_spent.get("asset"))
+        + _coerce_float(yt_spent.get("asset"))
+        + _coerce_float(lp_spent.get("asset")),
+        "spentEth": _coerce_float(pt_spent.get("eth"))
+        + _coerce_float(yt_spent.get("eth"))
+        + _coerce_float(lp_spent.get("eth")),
+        "profitUsd": _coerce_float(profit.get("usd")),
+        "profitAsset": _coerce_float(profit.get("asset")),
+        "profitEth": _coerce_float(profit.get("eth")),
+        "txValueAsset": _coerce_float(row.get("txValueAsset")),
+    }
+
+
+def _aggregate_pnl_rows(rows: list[Mapping[str, Any]], group_by: str) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    sets: dict[str, dict[str, set[Any]]] = {}
+    for row in rows:
+        if group_by == "action":
+            key = row.get("action") or ""
+        else:  # tx_hash
+            key = row.get("txHash") or ""
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = {
+                "key": key,
+                "count": 0,
+                "profitUsd": 0.0,
+                "profitAsset": 0.0,
+                "profitEth": 0.0,
+                "spentUsd": 0.0,
+                "spentAsset": 0.0,
+                "spentEth": 0.0,
+                "txValueAsset": 0.0,
+            }
+            if group_by == "action":
+                bucket["chainIds"] = []
+                bucket["markets"] = []
+            else:
+                bucket["actions"] = []
+                bucket["chainId"] = row.get("chainId")
+                bucket["market"] = row.get("market")
+                bucket["timestamp"] = row.get("timestamp")
+            buckets[key] = bucket
+            sets[key] = {
+                "actions": set(),
+                "chainIds": set(),
+                "markets": set(),
+            }
+        flat = _flatten_pnl_row(row)
+        bucket["count"] += 1
+        for fk in (
+            "profitUsd",
+            "profitAsset",
+            "profitEth",
+            "spentUsd",
+            "spentAsset",
+            "spentEth",
+            "txValueAsset",
+        ):
+            bucket[fk] += flat[fk]
+        meta = sets[key]
+        action = row.get("action")
+        if action is not None:
+            meta["actions"].add(action)
+        chain_id = row.get("chainId")
+        if chain_id is not None:
+            meta["chainIds"].add(chain_id)
+        market = row.get("market")
+        if market is not None:
+            meta["markets"].add(market)
+        if group_by == "tx_hash":
+            ts = row.get("timestamp")
+            if ts and (bucket["timestamp"] is None or ts < bucket["timestamp"]):
+                bucket["timestamp"] = ts
+
+    for key, bucket in buckets.items():
+        meta = sets[key]
+        if group_by == "action":
+            bucket["chainIds"] = sorted(meta["chainIds"])
+            bucket["markets"] = sorted(meta["markets"])
+        else:
+            bucket["actions"] = sorted(meta["actions"])
+
+    return sorted(buckets.values(), key=lambda b: b["count"], reverse=True)
+
 
 def _parse_ohlcv_results_csv(results: str) -> list[dict[str, str]]:
     reader = csv.reader(io.StringIO(results))
@@ -256,16 +361,90 @@ async def pendle_get_user_pnl_transactions(
     limit: int | None = None,
     chain_id: int | None = None,
     market: str | None = None,
+    group_by: str | None = None,
+    max_pages: int | None = None,
 ) -> Any:
-    """Get user transaction by address. (GET /v1/pnl/transactions)"""
-    async with PendleApiClient.from_env() as client:
-        return await client.get_user_pnl_transactions(
-            user=user,
-            skip=skip,
-            limit=limit,
-            chain_id=chain_id,
-            market=market,
+    """Get user transaction by address. (GET /v1/pnl/transactions)
+
+    Notes:
+    - Without `group_by`: returns raw paginated response `{total, results: [...]}` and
+      `skip` / `limit` page through it directly.
+    - With `group_by="action"` or `"tx_hash"`: paginates internally (page size = `limit`,
+      default 100) up to `max_pages` (default 20) and aggregates the fetched rows into
+      `{user, chainId, market, groupBy, total, scanned, pagesFetched, maxPages,
+      truncated, groups: [...]}`. Each group carries `count`, summed
+      `profit{Usd,Asset,Eth}`, summed `spent{Usd,Asset,Eth}` (pt+yt+lp legs combined),
+      `txValueAsset`, plus mode-specific fields (`action` mode: `chainIds` / `markets`;
+      `tx_hash` mode: `actions` / `chainId` / `market` / `timestamp`).
+    - `skip` is rejected when `group_by` is set — the loop always starts at offset 0.
+    """
+    if group_by is not None and group_by not in _PNL_GROUP_BY_ALLOWED:
+        raise ValueError(
+            "group_by must be one of action / tx_hash. "
+            f"Invalid group_by={group_by!r}."
         )
+
+    async with PendleApiClient.from_env() as client:
+        if group_by is None:
+            return await client.get_user_pnl_transactions(
+                user=user,
+                skip=skip,
+                limit=limit,
+                chain_id=chain_id,
+                market=market,
+            )
+
+        if skip is not None:
+            raise ValueError(
+                "skip is not allowed when group_by is set; aggregation always starts at offset 0."
+            )
+        page_size = limit if limit is not None else _PNL_DEFAULT_PAGE_SIZE
+        if page_size <= 0:
+            raise ValueError(f"limit must be positive when group_by is set; got {page_size}.")
+        cap_pages = max_pages if max_pages is not None else _PNL_DEFAULT_MAX_PAGES
+        if cap_pages <= 0:
+            raise ValueError(f"max_pages must be positive; got {cap_pages}.")
+
+        rows: list[Mapping[str, Any]] = []
+        total: int | None = None
+        offset = 0
+        pages_fetched = 0
+        for _ in range(cap_pages):
+            page = await client.get_user_pnl_transactions(
+                user=user,
+                skip=offset,
+                limit=page_size,
+                chain_id=chain_id,
+                market=market,
+            )
+            pages_fetched += 1
+            if not isinstance(page, Mapping):
+                break
+            if total is None and isinstance(page.get("total"), int):
+                total = page["total"]
+            results = page.get("results")
+            if not isinstance(results, list) or not results:
+                break
+            rows.extend(results)
+            if len(results) < page_size:
+                break
+            if total is not None and len(rows) >= total:
+                break
+            offset += len(results)
+
+        truncated = total is not None and len(rows) < total
+        return {
+            "user": user,
+            "chainId": chain_id,
+            "market": market,
+            "groupBy": group_by,
+            "total": total,
+            "scanned": len(rows),
+            "pagesFetched": pages_fetched,
+            "maxPages": cap_pages,
+            "truncated": truncated,
+            "groups": _aggregate_pnl_rows(rows, group_by),
+        }
 
 
 @mcp.tool()
