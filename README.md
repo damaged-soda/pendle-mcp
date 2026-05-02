@@ -48,6 +48,7 @@ python -m pendle_mcp   # stdio 运行
   - `slippage` 是**比例小数**且范围 `[0, 1]`（0.5% → `0.005`，50% → `0.5`）。
   - `tokens_in` / `amounts_in` 长度必须一致；`tokens_out` 不能为空。
   - `amounts_in` 必须是输入 token **最小单位**的 base-10 **整数字符串**（decimals=18 时 `0.001` → `"1000000000000000"`），禁止传 `"0.001"`。
+  - `include_tx`（默认 `false`）：默认丢弃 `routes[].tx` 与 `routes[].contractParamInfo.contractCallParams`，避免 calldata 撑爆 MCP 响应。报价 / 套利扫描默认即可；要广播交易再传 `true`。保留字段：`action` / `inputs` / `requiredApprovals` / `routes[].outputs` / `routes[].data`（`aggregatorType` / `priceImpact` / `priceImpactBreakDown` / `fee`）/ `routes[].contractParamInfo.method` / `contractCallParamsName`。
 - **`time_frame` 别名**：`pendle_get_market_historical_data_v3` 和 `pendle_get_prices_ohlcv_v4` 接受 `1h / 1d / 1w`，本地规范化成 `hour / day / week` 再请求 API；非法值本地直接报错，不发起 HTTP。
 - **`pendle_get_market_historical_data_v3.include_apy_breakdown`**：v3 新参，附加 APY 拆解字段。
 - **`pendle_get_prices_ohlcv_v4.parse_results`**：默认 `false`；开启后把响应里 `results` 的 CSV 串解析成 `results_parsed`（结构化数组、字符串字段保精度），解析失败会带 `parse_error`。

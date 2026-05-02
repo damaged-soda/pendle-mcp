@@ -484,6 +484,34 @@ async def pendle_get_pt_cross_chain_metadata(*, chain_id: int, pt: str) -> Any:
         return await client.get_pt_cross_chain_metadata(chain_id=chain_id, pt=pt)
 
 
+def _strip_convert_v2_tx_fields(response: Any) -> Any:
+    """Drop tx calldata and encoded contract params from a convert v2 response.
+
+    Removes per route:
+    - `tx` (contains `tx.data` calldata, dominant size cost, and grows large for
+      aggregator routes)
+    - `contractParamInfo.contractCallParams` (encoded args, useless without tx
+      execution)
+
+    Keeps `contractParamInfo.method` / `contractParamInfo.contractCallParamsName`,
+    `outputs`, `data`, and all top-level fields — that's what scanning callers
+    need (amountOut, method, aggregatorType, priceImpact, fee, route count).
+    """
+    if not isinstance(response, dict):
+        return response
+    routes = response.get("routes")
+    if not isinstance(routes, list):
+        return response
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        route.pop("tx", None)
+        info = route.get("contractParamInfo")
+        if isinstance(info, dict):
+            info.pop("contractCallParams", None)
+    return response
+
+
 @mcp.tool()
 async def pendle_convert_v2(
     *,
@@ -499,6 +527,7 @@ async def pendle_convert_v2(
     need_scale: bool | None = None,
     additional_data: str | None = None,
     use_limit_order: bool | None = None,
+    include_tx: bool = False,
 ) -> Any:
     """Universal convert function. (GET /v2/sdk/{chainId}/convert)
 
@@ -509,9 +538,13 @@ async def pendle_convert_v2(
       Example (decimals=18): `0.001 * 10**18 = 1000000000000000` => `"1000000000000000"`.
     - `need_scale` is forwarded to the Pendle API. It does NOT auto-convert human-readable decimals
       in `amounts_in` to smallest-unit integers.
+    - `include_tx` (default False) — when False, drop `routes[].tx` (calldata) and
+      `routes[].contractParamInfo.contractCallParams` (encoded args) from the response.
+      Set True only when you actually need to broadcast the tx; leaving it False
+      keeps scanning / quoting responses small.
     """
     async with PendleApiClient.from_env() as client:
-        return await client.convert_v2(
+        response = await client.convert_v2(
             chain_id=chain_id,
             slippage=slippage,
             tokens_in=tokens_in,
@@ -525,6 +558,9 @@ async def pendle_convert_v2(
             additional_data=additional_data,
             use_limit_order=use_limit_order,
         )
+    if not include_tx:
+        response = _strip_convert_v2_tx_fields(response)
+    return response
 
 
 @mcp.tool()
