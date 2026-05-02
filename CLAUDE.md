@@ -1,6 +1,6 @@
 # 子仓面包屑
 
-这个仓是 home-ops 系统的一片碎片。**完整上下文请先读 `~/work/home-ops/AGENTS.md`** —— 那里有架构图、决策日志、运维手册和当前状态。（同目录下也有等价的 `CLAUDE.md`，Claude Code / Codex / 其他 agent 都能找到入口。）
+这个仓是 home-ops 系统的一片碎片。**完整上下文请先读 `~/work/home-ops/AGENTS.md`** —— 那里有架构图、决策日志、运维手册和当前状态。（同目录下也有等价的 `AGENTS.md`，Claude Code / Codex / 其他 agent 都能找到入口。）
 
 ## 本仓职责
 
