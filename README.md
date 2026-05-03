@@ -51,7 +51,7 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
 | Health | `pendle_health` |
 | Markets | `pendle_get_markets_all`（分页 v2）、`pendle_get_markets_points_market`、`pendle_get_market_data_v2`、`pendle_get_market_historical_data_v3` |
 | Assets / Prices | `pendle_get_assets_all`、`pendle_get_asset_prices`、`pendle_get_prices_ohlcv_v4` |
-| Transactions | `pendle_get_user_pnl_transactions`、`pendle_get_market_transactions_v5` |
+| Transactions | `pendle_get_user_pnl_transactions`、`pendle_get_user_pnl_summary`、`pendle_get_market_transactions_v5` |
 | PnL | `pendle_get_user_pnl_gained_positions` |
 | Dashboard | `pendle_get_user_positions`、`pendle_get_merkle_rewards` |
 | Limit Orders | `pendle_get_limit_orders_all_v2`、`pendle_get_limit_orders_archived_v2`、`pendle_get_limit_orders_book_v2`、`pendle_get_limit_orders_maker_limit_orders`、`pendle_get_limit_orders_taker_limit_orders` |
@@ -74,7 +74,8 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
 - **`pendle_get_market_historical_data_v3.include_apy_breakdown`**：v3 新参，附加 APY 拆解字段。
 - **`pendle_get_prices_ohlcv_v4.parse_results`**：默认 `false`；开启后把响应里 `results` 的 CSV 串解析成 `results_parsed`（结构化数组、字符串字段保精度），解析失败会带 `parse_error`。
 - **`pendle_get_merkle_rewards`**：响应同时包含 `claimableRewards`（待领取）与 `claimedRewards`（已领取），取代旧的 `pendle_get_merkle_claimed_rewards`。
-- **`pendle_get_user_pnl_transactions.group_by`**：可选 `"action"` / `"tx_hash"`。不传时维持原行为（单页 `{total, results}`，`skip` / `limit` 直接翻页）。传了之后内部从 `skip=0` 起循环拉页（页大小 = `limit`，默认 `100`）直至拉完 `total`、命中 `max_pages`（默认 `20`），或上游返回不足一页停下；返回聚合形状 `{user, chainId, market, groupBy, total, scanned, pagesFetched, maxPages, truncated, groups}`。每个 group 带 `count` / `profit{Usd,Asset,Eth}` / `spent{Usd,Asset,Eth}`（pt+yt+lp 三腿合并）/ `txValueAsset`：`action` 模式额外给 `chainIds` / `markets`，`tx_hash` 模式额外给 `actions` / `chainId` / `market` / `timestamp`（取该 tx 内最早一条）。**`group_by` 设了之后传 `skip` 会报错**（聚合永远从偏移 0 开始）。
+- **`pendle_get_user_pnl_transactions`**：纯翻页器，原样透传 API 的 `{total, results}`，`skip` / `limit` 直接翻页。要"对一个地址做整体评估"用下面的 `pendle_get_user_pnl_summary`，不要在这个 tool 上手工累加 page。
+- **`pendle_get_user_pnl_summary`**：扫全部页 + 聚合。参数 `user` / `chain_id?` / `market?` / `group_by` (`"action"` 默认 / `"tx_hash"`) / `page_size?`（默认 100，仅控制内部翻页粒度，不改变结果完整度）。**没有** `max_pages`、**没有** `truncated` —— 返回时一定是整段历史；地址 PnL 行数超过 `_PNL_SUMMARY_HARD_CAP_ROWS`（10000）会显式 raise，让调用方走 raw 翻页器自己分批，绝不会返回看起来"完整"实则截断的聚合。返回 `{user, chainId, market, groupBy, scanned, pagesFetched, totalProfit{Usd,Asset,Eth}, totalTxValueAsset, groups}`。每个 group 带 `count` / `profit{Usd,Asset,Eth}` / `spent{Usd,Asset,Eth}`（pt+yt+lp 三腿合并）/ `txValueAsset`：`action` 模式额外给 `chainIds` / `markets`，`tx_hash` 模式额外给 `actions` / `chainId` / `market` / `timestamp`（取该 tx 内最早一条）。`spent` 不出顶层 —— pt/yt/lp 三腿不是单一有符号量，要 capital-adjusted ROI 走 `groups[*].spent*`。
 
 API 错误统一返回 `PendleApiError`，字段：`error_type / status_code / method / path / params / attempts / retries_exhausted / url / detail`。其中 `params / url` 会对敏感或超长字段（如 `additionalData`）脱敏 / 截断；`detail` 按上限截断（默认 2048，可用 `PENDLE_API_ERROR_DETAIL_MAX_CHARS` 调）。
 

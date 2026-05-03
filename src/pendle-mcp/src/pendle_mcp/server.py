@@ -26,8 +26,12 @@ mcp = FastMCP("pendle-mcp")
 _OHLCV_RESULT_KEYS = ("time", "open", "high", "low", "close", "volume")
 
 _PNL_GROUP_BY_ALLOWED = {"action", "tx_hash"}
-_PNL_DEFAULT_PAGE_SIZE = 100
-_PNL_DEFAULT_MAX_PAGES = 20
+_PNL_SUMMARY_DEFAULT_PAGE_SIZE = 100
+# Hard upper bound on rows scanned by `pendle_get_user_pnl_summary`. Picked
+# generously (≈100 active retail addresses' lifetime PnL) so it should never
+# trip in normal use; if it does, the tool raises so callers can't be misled
+# by a partial summary that *looks* complete.
+_PNL_SUMMARY_HARD_CAP_ROWS = 10000
 
 
 def _coerce_float(value: Any) -> float:
@@ -56,6 +60,25 @@ def _flatten_pnl_row(row: Mapping[str, Any]) -> dict[str, float]:
         "profitEth": _coerce_float(profit.get("eth")),
         "txValueAsset": _coerce_float(row.get("txValueAsset")),
     }
+
+
+def _totals_from_pnl_rows(rows: list[Mapping[str, Any]]) -> dict[str, float]:
+    """Sum profit + txValueAsset across all rows. Spent intentionally omitted —
+    callers wanting capital-adjusted ROI should pull `groups[*].spent*` since
+    spent isn't a single signed quantity at the top level (pt+yt+lp legs)."""
+    totals = {
+        "totalProfitUsd": 0.0,
+        "totalProfitAsset": 0.0,
+        "totalProfitEth": 0.0,
+        "totalTxValueAsset": 0.0,
+    }
+    for row in rows:
+        flat = _flatten_pnl_row(row)
+        totals["totalProfitUsd"] += flat["profitUsd"]
+        totals["totalProfitAsset"] += flat["profitAsset"]
+        totals["totalProfitEth"] += flat["profitEth"]
+        totals["totalTxValueAsset"] += flat["txValueAsset"]
+    return totals
 
 
 def _aggregate_pnl_rows(rows: list[Mapping[str, Any]], group_by: str) -> list[dict[str, Any]]:
@@ -361,90 +384,108 @@ async def pendle_get_user_pnl_transactions(
     limit: int | None = None,
     chain_id: int | None = None,
     market: str | None = None,
-    group_by: str | None = None,
-    max_pages: int | None = None,
 ) -> Any:
-    """Get user transaction by address. (GET /v1/pnl/transactions)
+    """Get user transactions by address. (GET /v1/pnl/transactions)
 
-    Notes:
-    - Without `group_by`: returns raw paginated response `{total, results: [...]}` and
-      `skip` / `limit` page through it directly.
-    - With `group_by="action"` or `"tx_hash"`: paginates internally (page size = `limit`,
-      default 100) up to `max_pages` (default 20) and aggregates the fetched rows into
-      `{user, chainId, market, groupBy, total, scanned, pagesFetched, maxPages,
-      truncated, groups: [...]}`. Each group carries `count`, summed
-      `profit{Usd,Asset,Eth}`, summed `spent{Usd,Asset,Eth}` (pt+yt+lp legs combined),
-      `txValueAsset`, plus mode-specific fields (`action` mode: `chainIds` / `markets`;
-      `tx_hash` mode: `actions` / `chainId` / `market` / `timestamp`).
-    - `skip` is rejected when `group_by` is set — the loop always starts at offset 0.
+    Pure paginator: returns the raw API response `{total, results: [...]}`. Use
+    `skip` / `limit` to page through `total`. For aggregated PnL across the
+    user's full history, use `pendle_get_user_pnl_summary` instead — that tool
+    scans every page and emits per-action / per-tx_hash summaries with totals.
     """
-    if group_by is not None and group_by not in _PNL_GROUP_BY_ALLOWED:
+    async with PendleApiClient.from_env() as client:
+        return await client.get_user_pnl_transactions(
+            user=user,
+            skip=skip,
+            limit=limit,
+            chain_id=chain_id,
+            market=market,
+        )
+
+
+@mcp.tool()
+async def pendle_get_user_pnl_summary(
+    *,
+    user: str,
+    chain_id: int | None = None,
+    market: str | None = None,
+    group_by: str = "action",
+    page_size: int | None = None,
+) -> Any:
+    """Aggregate PnL across the user's full history. (scans GET /v1/pnl/transactions)
+
+    Scans every page (no soft cap, so the result is always complete) and
+    aggregates by `action` (default) or `tx_hash`. Returns:
+
+        {user, chainId, market, groupBy, scanned, pagesFetched,
+         totalProfit{Usd,Asset,Eth}, totalTxValueAsset, groups}
+
+    `total*` are summed across `scanned` rows — and `scanned` always equals the
+    address's full PnL row count, since this tool refuses to truncate. Spent is
+    omitted at the top level (pt+yt+lp legs aren't a single signed quantity);
+    pull `groups[*].spent*` for capital-adjusted ROI.
+
+    Each group carries `count`, summed `profit{Usd,Asset,Eth}`, summed
+    `spent{Usd,Asset,Eth}` (pt+yt+lp legs combined), `txValueAsset`, plus
+    mode-specific fields (`action`: `chainIds` / `markets`; `tx_hash`:
+    `actions` / `chainId` / `market` / `timestamp`).
+
+    Safety: raises ValueError if the address has more than
+    `_PNL_SUMMARY_HARD_CAP_ROWS` (≈10000) rows — bypass via the raw
+    `pendle_get_user_pnl_transactions` paginator with explicit `skip` / `limit`
+    bounds.
+    """
+    if group_by not in _PNL_GROUP_BY_ALLOWED:
         raise ValueError(
             "group_by must be one of action / tx_hash. "
             f"Invalid group_by={group_by!r}."
         )
+    page_size_eff = page_size if page_size is not None else _PNL_SUMMARY_DEFAULT_PAGE_SIZE
+    if page_size_eff <= 0:
+        raise ValueError(f"page_size must be positive; got {page_size_eff}.")
 
+    rows: list[Mapping[str, Any]] = []
+    offset = 0
+    pages_fetched = 0
     async with PendleApiClient.from_env() as client:
-        if group_by is None:
-            return await client.get_user_pnl_transactions(
-                user=user,
-                skip=skip,
-                limit=limit,
-                chain_id=chain_id,
-                market=market,
-            )
-
-        if skip is not None:
-            raise ValueError(
-                "skip is not allowed when group_by is set; aggregation always starts at offset 0."
-            )
-        page_size = limit if limit is not None else _PNL_DEFAULT_PAGE_SIZE
-        if page_size <= 0:
-            raise ValueError(f"limit must be positive when group_by is set; got {page_size}.")
-        cap_pages = max_pages if max_pages is not None else _PNL_DEFAULT_MAX_PAGES
-        if cap_pages <= 0:
-            raise ValueError(f"max_pages must be positive; got {cap_pages}.")
-
-        rows: list[Mapping[str, Any]] = []
-        total: int | None = None
-        offset = 0
-        pages_fetched = 0
-        for _ in range(cap_pages):
+        while True:
             page = await client.get_user_pnl_transactions(
                 user=user,
                 skip=offset,
-                limit=page_size,
+                limit=page_size_eff,
                 chain_id=chain_id,
                 market=market,
             )
             pages_fetched += 1
             if not isinstance(page, Mapping):
                 break
-            if total is None and isinstance(page.get("total"), int):
-                total = page["total"]
             results = page.get("results")
             if not isinstance(results, list) or not results:
                 break
             rows.extend(results)
-            if len(results) < page_size:
+            if len(rows) > _PNL_SUMMARY_HARD_CAP_ROWS:
+                raise ValueError(
+                    f"user {user!r} has more than {_PNL_SUMMARY_HARD_CAP_ROWS} "
+                    "PnL rows; the summary refuses to truncate. Fetch the raw "
+                    "rows in batches via pendle_get_user_pnl_transactions("
+                    "user=..., skip=..., limit=...) and aggregate client-side."
+                )
+            if len(results) < page_size_eff:
                 break
-            if total is not None and len(rows) >= total:
+            api_total = page.get("total")
+            if isinstance(api_total, int) and len(rows) >= api_total:
                 break
             offset += len(results)
 
-        truncated = total is not None and len(rows) < total
-        return {
-            "user": user,
-            "chainId": chain_id,
-            "market": market,
-            "groupBy": group_by,
-            "total": total,
-            "scanned": len(rows),
-            "pagesFetched": pages_fetched,
-            "maxPages": cap_pages,
-            "truncated": truncated,
-            "groups": _aggregate_pnl_rows(rows, group_by),
-        }
+    return {
+        "user": user,
+        "chainId": chain_id,
+        "market": market,
+        "groupBy": group_by,
+        "scanned": len(rows),
+        "pagesFetched": pages_fetched,
+        **_totals_from_pnl_rows(rows),
+        "groups": _aggregate_pnl_rows(rows, group_by),
+    }
 
 
 @mcp.tool()
