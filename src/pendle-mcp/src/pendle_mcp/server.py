@@ -58,6 +58,25 @@ def _flatten_pnl_row(row: Mapping[str, Any]) -> dict[str, float]:
     }
 
 
+def _totals_from_pnl_rows(rows: list[Mapping[str, Any]]) -> dict[str, float]:
+    """Sum profit + txValueAsset across all rows. Spent intentionally omitted —
+    callers wanting capital-adjusted ROI should pull `groups[*].spent*` since
+    spent isn't a single signed quantity at the top level."""
+    totals = {
+        "totalProfitUsd": 0.0,
+        "totalProfitAsset": 0.0,
+        "totalProfitEth": 0.0,
+        "totalTxValueAsset": 0.0,
+    }
+    for row in rows:
+        flat = _flatten_pnl_row(row)
+        totals["totalProfitUsd"] += flat["profitUsd"]
+        totals["totalProfitAsset"] += flat["profitAsset"]
+        totals["totalProfitEth"] += flat["profitEth"]
+        totals["totalTxValueAsset"] += flat["txValueAsset"]
+    return totals
+
+
 def _aggregate_pnl_rows(rows: list[Mapping[str, Any]], group_by: str) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = {}
     sets: dict[str, dict[str, set[Any]]] = {}
@@ -372,7 +391,9 @@ async def pendle_get_user_pnl_transactions(
     - With `group_by="action"` or `"tx_hash"`: paginates internally (page size = `limit`,
       default 100) up to `max_pages` (default 20) and aggregates the fetched rows into
       `{user, chainId, market, groupBy, total, scanned, pagesFetched, maxPages,
-      truncated, groups: [...]}`. Each group carries `count`, summed
+      truncated, totalProfit{Usd,Asset,Eth}, totalTxValueAsset, groups: [...]}`.
+      Top-level `total*` are summed across the `scanned` rows (so `truncated=true`
+      means the totals undercount). Each group carries `count`, summed
       `profit{Usd,Asset,Eth}`, summed `spent{Usd,Asset,Eth}` (pt+yt+lp legs combined),
       `txValueAsset`, plus mode-specific fields (`action` mode: `chainIds` / `markets`;
       `tx_hash` mode: `actions` / `chainId` / `market` / `timestamp`).
@@ -443,6 +464,7 @@ async def pendle_get_user_pnl_transactions(
             "pagesFetched": pages_fetched,
             "maxPages": cap_pages,
             "truncated": truncated,
+            **_totals_from_pnl_rows(rows),
             "groups": _aggregate_pnl_rows(rows, group_by),
         }
 

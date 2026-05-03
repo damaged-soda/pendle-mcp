@@ -11,6 +11,8 @@ def _make_row(
     market: str = "0xmarket",
     timestamp: str = "2026-05-01T00:00:00.000Z",
     profit_usd: float = 0.0,
+    profit_asset: float = 0.0,
+    profit_eth: float = 0.0,
     yt_spent_usd: float = 0.0,
     pt_spent_usd: float = 0.0,
     lp_spent_usd: float = 0.0,
@@ -26,7 +28,7 @@ def _make_row(
         "ptData": {"unit": 0, "spent_v2": {"usd": pt_spent_usd, "asset": 0, "eth": 0}},
         "ytData": {"unit": 0, "spent_v2": {"usd": yt_spent_usd, "asset": 0, "eth": 0}},
         "lpData": {"unit": 0, "spent_v2": {"usd": lp_spent_usd, "asset": 0, "eth": 0}},
-        "profit": {"usd": profit_usd, "asset": 0, "eth": 0},
+        "profit": {"usd": profit_usd, "asset": profit_asset, "eth": profit_eth},
         "txValueAsset": tx_value_asset,
     }
 
@@ -230,6 +232,93 @@ async def test_group_by_rejects_skip(monkeypatch: pytest.MonkeyPatch) -> None:
             skip=10,
         )
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_group_by_emits_top_level_totals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        _make_row(
+            action="buyPt",
+            tx_hash="0xa",
+            profit_usd=10,
+            profit_asset=0.5,
+            profit_eth=0.001,
+            tx_value_asset=200,
+        ),
+        _make_row(
+            action="buyPt",
+            tx_hash="0xb",
+            profit_usd=-3,
+            profit_asset=-0.1,
+            profit_eth=-0.0002,
+            tx_value_asset=80,
+        ),
+        _make_row(
+            action="redeemYtYield",
+            tx_hash="0xc",
+            profit_usd=20,
+            profit_asset=1.0,
+            profit_eth=0.002,
+            tx_value_asset=0,
+        ),
+    ]
+    client = _PaginatedClient(rows)
+    _patch_client(monkeypatch, client)
+
+    data = await server.pendle_get_user_pnl_transactions(
+        user="0xuser",
+        group_by="action",
+    )
+
+    assert data["totalProfitUsd"] == pytest.approx(27.0)
+    assert data["totalProfitAsset"] == pytest.approx(1.4)
+    assert data["totalProfitEth"] == pytest.approx(0.0028)
+    assert data["totalTxValueAsset"] == pytest.approx(280.0)
+    # Sanity: totals == sum across groups (computed independently in the server)
+    sum_profit_usd = sum(g["profitUsd"] for g in data["groups"])
+    assert sum_profit_usd == pytest.approx(data["totalProfitUsd"])
+
+
+@pytest.mark.asyncio
+async def test_group_by_none_does_not_inject_totals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [_make_row(action="buyPt", tx_hash="0x1", profit_usd=5)]
+    client = _PaginatedClient(rows)
+    _patch_client(monkeypatch, client)
+
+    data = await server.pendle_get_user_pnl_transactions(user="0xuser")
+
+    # Pass-through mode: response is the raw API shape, no totalProfit* fields.
+    assert "totalProfitUsd" not in data
+    assert "totalTxValueAsset" not in data
+
+
+@pytest.mark.asyncio
+async def test_group_by_truncated_totals_only_count_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 6 rows of $10 profit each = $60 total available; max_pages caps at 4 rows scanned.
+    rows = [
+        _make_row(action="buyPt", tx_hash=f"0x{i}", profit_usd=10)
+        for i in range(6)
+    ]
+    client = _PaginatedClient(rows)
+    _patch_client(monkeypatch, client)
+
+    data = await server.pendle_get_user_pnl_transactions(
+        user="0xuser",
+        group_by="action",
+        limit=2,
+        max_pages=2,
+    )
+
+    assert data["truncated"] is True
+    assert data["scanned"] == 4
+    # Totals reflect scanned rows only, not the full 60.
+    assert data["totalProfitUsd"] == pytest.approx(40.0)
 
 
 @pytest.mark.asyncio
