@@ -72,6 +72,12 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
   - `include_tx`（默认 `false`）：默认丢弃 `routes[].tx` 与 `routes[].contractParamInfo.contractCallParams`，避免 calldata 撑爆 MCP 响应。报价 / 套利扫描默认即可；要广播交易再传 `true`。保留字段：`action` / `inputs` / `requiredApprovals` / `routes[].outputs` / `routes[].data`（`aggregatorType` / `priceImpact` / `priceImpactBreakDown` / `fee`）/ `routes[].contractParamInfo.method` / `contractCallParamsName`。
 - **`time_frame` 别名**：`pendle_get_market_historical_data_v3` 和 `pendle_get_prices_ohlcv_v4` 接受 `1h / 1d / 1w`，本地规范化成 `hour / day / week` 再请求 API；非法值本地直接报错，不发起 HTTP。
 - **`pendle_get_market_historical_data_v3.include_apy_breakdown`**：v3 新参，附加 APY 拆解字段。
+- **Pendle hosted-API APY 字段语义（重要）**：`underlyingApy` / `baseApy` / `ytFloatingApy` / `aggregatedApy` / `maxBoostedApy` / `ytRoi` 这一族字段都是 **短 sliding-window display value**，不是链上 ground truth。Pendle 后端把最近几天的 `SY.exchangeRate` 增长 annualize，所以 NAV-discrete / occasional-distribute 类 underlying（如 Midas mHYPER 周 NAV push、Superform distribute 类）会被系统性高估 2-6×；连续累息类（Ethena sUSDe / 每日 pulse）碰巧 < 15% 偏差但这是 underlying 的特性，**字段本身永远是 sliding window**。详见 pendle-research finding 26。
+- **`pendle_get_market_data_v2` 链上校准**：响应**始终附加**以下字段（即使校准失败也照常返回数据）：
+  - `u_actual_30d_chain`: float | null —— 链上算的 30d window annualized APY（decimal，例如 `0.0407` 表示 4.07%）。公式：`(SY.exchangeRate(latest_block) / SY.exchangeRate(B30) − 1) × 365 / 30`，其中 `B30` 是 `block.timestamp ≤ latest_ts − 30d` 的最大块（`eth_getBlockByNumber` 二分查找；不是 `latest − 固定 N 个 block`）。注意：即使你传 `timestamp` 拉历史 market data，这个字段始终基于**当前** latest block，是「现在的链上真相」，不是历史时刻的。
+  - `u_ui_vs_chain_ratio`: float | null —— `underlyingApy / u_actual_30d_chain`，diagnostic。≈ 1.0 说明 UI 跟链上对齐；> 1.5 强烈暗示 underlying 是 NAV-discrete / pulse 类，UI 处于 sliding window 残留高估区。
+  - `u_actual_chain_error`: str —— 只在 `u_actual_30d_chain` 为 null 时出现，解释原因（缺 `RPC_URL_<chainId>`、chain 历史不足 30d、合约 revert、markets/all lookup 失败等）。
+- **链上校准的 RPC 约束**：需要 archive RPC，跟 etherscan-mcp 一致从 `RPC_URL_<chainid>` 读。Etherscan `module=proxy` 的 eth_call 永远返回 latest（即使传历史 block tag），所以**不会** fallback 到它 —— 没配 RPC 就直接报 error。30d-ago block 走 `eth_getBlockByNumber` timestamp 搜索（Newton 估算 + cadence-guided bisect，不维护静态 chain block-time 表，Pendle 新加链不改代码就能用）；实测 ETH 6 RPC / ~1s、Arb 10 RPC / ~1.3s。chain 历史 < 30d 时返回 `u_actual_chain_error="chain too young: ..."`。
 - **`pendle_get_prices_ohlcv_v4.parse_results`**：默认 `false`；开启后把响应里 `results` 的 CSV 串解析成 `results_parsed`（结构化数组、字符串字段保精度），解析失败会带 `parse_error`。
 - **`pendle_get_merkle_rewards`**：响应同时包含 `claimableRewards`（待领取）与 `claimedRewards`（已领取），取代旧的 `pendle_get_merkle_claimed_rewards`。
 - **`pendle_get_user_pnl_transactions`**：纯翻页器，原样透传 API 的 `{total, results}`，`skip` / `limit` 直接翻页。要"对一个地址做整体评估"用下面的 `pendle_get_user_pnl_summary`，不要在这个 tool 上手工累加 page。
@@ -89,6 +95,7 @@ API 错误统一返回 `PendleApiError`，字段：`error_type / status_code / m
 | `PENDLE_API_RETRY_BACKOFF_SECONDS` | `0.2` | 指数退避基数 + jitter |
 | `PENDLE_API_MAX_CONCURRENCY` | `4` | 进程级出站并发上限。所有 `PendleApiClient` 共享一个 `asyncio.Semaphore`，槽位贯穿整个重试循环（包括 backoff sleep）—— 给 Pendle 真正的 cooldown 喘息，避免 inflight 互相 barge 重新触发 429。设大数字（如 `1000`）等于关闭。 |
 | `PENDLE_API_ERROR_DETAIL_MAX_CHARS` | `2048` | 错误 `detail` 字段截断上限 |
+| `RPC_URL_<chainid>` | （未设） | 链上 SY.exchangeRate 校准用的 archive JSON-RPC 端点。仅 `pendle_get_market_data_v2` 用；未设时 `u_actual_30d_chain` 走 null + 诊断字段。命名跟 etherscan-mcp 一致，所以同一份 env 两边都生效。 |
 
 ## 命名约定
 

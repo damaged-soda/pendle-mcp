@@ -1,3 +1,24 @@
+"""FastMCP server tools wrapping Pendle's hosted API.
+
+Be careful with the APY fields Pendle's hosted API returns — `underlyingApy`,
+`baseApy`, `ytFloatingApy`, `aggregatedApy`, `ytRoi` and friends are
+short-sliding-window display values, not on-chain ground truth. They
+annualize the *recent* `SY.exchangeRate` change, so NAV-discrete /
+occasional-distribute underlyings (Midas weekly NAV pushes, Superform
+distribute events, etc.) get systematically overstated by 2-6× until the
+sliding window rolls past the jump. Continuous-accrual underlyings (Ethena
+7d-vest, daily-pulse vaults) happen to track ground truth within ~15%, but
+that's happenstance — the field semantics are the same. See
+pendle-research finding 26 + `infra/underlying-apy-ground-truth.md` for
+reference samples.
+
+For ground truth, `pendle_get_market_data_v2` always attaches
+`u_actual_30d_chain` (and the diagnostic `u_ui_vs_chain_ratio`) computed by
+reading `SY.exchangeRate()` at `latest_block` and at the largest block whose
+timestamp is at or before `latest_ts - 30d` (found via `eth_getBlockByNumber`
+bisect on `RPC_URL_<chainid>`) — see `pendle_mcp.chain_apy`.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +27,7 @@ import io
 import time
 from typing import Any, Mapping
 
+from pendle_mcp.chain_apy import compute_u_actual_30d_chain, parse_sy_address
 from pendle_mcp.pendle_api import (
     PendleApiClient,
     PendleApiError,
@@ -231,13 +253,138 @@ async def pendle_get_market_data_v2(
     address: str,
     timestamp: str | None = None,
 ) -> Any:
-    """Get latest/historical market data by address. (GET /v2/{chainId}/markets/{address}/data)"""
+    """Get latest/historical market data by address. (GET /v2/{chainId}/markets/{address}/data)
+
+    APY field semantics — important:
+    - `underlyingApy`, `underlyingInterestApy`, `underlyingRewardApy`, `ytFloatingApy`,
+      `aggregatedApy`, `maxBoostedApy` and other Pendle-computed APYs are
+      **short sliding-window display values**, not on-chain ground truth. Pendle
+      annualizes the recent `SY.exchangeRate` change over a few-day window, so
+      NAV-discrete / occasional-distribute underlyings get overstated 2-6×
+      (e.g. Midas weekly-NAV mHYPER, Superform distribute superUSDC); continuous-
+      accrual underlyings (Ethena sUSDe etc.) happen to track ground truth
+      within ~15% but this is a property of the underlying, not the field.
+    - For ground truth use `u_actual_30d_chain` (always attached below) or call
+      `SY.exchangeRate()` yourself across `latest_block` vs the block at
+      `latest_ts - 30d` (found via `eth_getBlockByNumber` timestamp bisect, not
+      a fixed block-count offset — chain cadence varies).
+
+    Extra fields this tool injects (always present, even when calibration fails):
+    - `u_actual_30d_chain`: float | None — on-chain annualized 30d window APY,
+      decimal (e.g. 0.0407 for 4.07%). Computed at `latest` block regardless of
+      the `timestamp` arg — calibration is "now", not historical.
+    - `u_ui_vs_chain_ratio`: float | None — `underlyingApy / u_actual_30d_chain`.
+      Diagnostic: 1.0 ≈ UI matches chain; > 1.5 strongly suggests the underlying
+      is event-pulsed and UI is in the post-pulse sliding-window tail.
+    - `u_actual_chain_error`: str — present only when `u_actual_30d_chain` is
+      None; explains why (missing `RPC_URL_<chainId>`, chain too young for a 30d
+      window, contract revert, markets/all lookup failure, …).
+
+    Calibration requires an archive RPC at `RPC_URL_<chainId>` env var
+    (Etherscan's `module=proxy` eth_call always returns latest state for
+    historical blocks, so we deliberately do not fall back to it). The 30d-ago
+    block is located via Newton-style cadence estimation + cadence-guided
+    bisect on `eth_getBlockByNumber` timestamps — typically 6-10 RPC calls
+    (~1-2s wall-clock) on any chain Pendle lists (HyperEVM, Berachain, …)
+    without a hardcoded block-time table.
+
+    Caveat: this calibration assumes the SY's yield accrues into
+    `SY.exchangeRate()` (the standard interest-bearing model). For SYs that
+    instead distribute yield via separate reward tokens (e.g. some HyperEVM
+    LST wrappers), `u_actual_30d_chain` may come back at ~0 even when the UI
+    `underlyingApy` is non-trivial — that's not a calibration bug, it's the
+    SY using a reward-distribution model the `exchangeRate()` accumulator
+    doesn't capture.
+    """
+    market_id = f"{chain_id}-{address}"
     async with PendleApiClient.from_env() as client:
-        return await client.get_market_data_v2(
-            chain_id=chain_id,
-            address=address,
-            timestamp=timestamp,
+        # markets/all is best-effort — its only job is to give us the SY
+        # address for chain calibration. A 429 / 5xx / network blip there
+        # must not break the main data response; it becomes a calibration
+        # error and gets surfaced via `u_actual_chain_error`.
+        data, market_meta = await asyncio.gather(
+            client.get_market_data_v2(
+                chain_id=chain_id,
+                address=address,
+                timestamp=timestamp,
+            ),
+            client.get_markets_all(chain_id=chain_id, ids=[market_id]),
+            return_exceptions=True,
         )
+    if isinstance(data, BaseException):
+        raise data
+
+    return await _attach_chain_calibration(
+        data=data,
+        chain_id=chain_id,
+        market_meta=market_meta,
+    )
+
+
+async def _attach_chain_calibration(
+    *,
+    data: Any,
+    chain_id: int,
+    market_meta: Any,
+) -> Any:
+    """Inject `u_actual_30d_chain` / `u_ui_vs_chain_ratio` (+ optional error) into a
+    market data response. Defensive: never raises — surfaces failures via the
+    diagnostic string so the caller still gets the Pendle data."""
+    if not isinstance(data, dict):
+        return data
+
+    sy_address, sy_error = _extract_sy_address(market_meta)
+    if sy_address is None:
+        data["u_actual_30d_chain"] = None
+        data["u_ui_vs_chain_ratio"] = None
+        data["u_actual_chain_error"] = sy_error
+        return data
+
+    value, error = await compute_u_actual_30d_chain(
+        chain_id=chain_id,
+        sy_address=sy_address,
+    )
+    data["u_actual_30d_chain"] = value
+    data["u_ui_vs_chain_ratio"] = _compute_ui_vs_chain_ratio(
+        ui_value=data.get("underlyingApy"),
+        chain_value=value,
+    )
+    if error is not None:
+        data["u_actual_chain_error"] = error
+    return data
+
+
+def _extract_sy_address(market_meta: Any) -> tuple[str | None, str | None]:
+    """Pull the SY address out of a `/v2/markets/all` response. Returns
+    `(sy_address, error)`. Handles the case where `market_meta` is itself an
+    exception (best-effort markets/all call failed in `asyncio.gather`)."""
+    if isinstance(market_meta, BaseException):
+        if isinstance(market_meta, PendleApiError):
+            return None, f"markets/all lookup failed: {market_meta.summary()}"
+        return None, (
+            f"markets/all lookup failed: {type(market_meta).__name__}: {market_meta}"
+        )
+    if not isinstance(market_meta, Mapping):
+        return None, "markets/all lookup returned unexpected shape"
+    results = market_meta.get("results")
+    if not isinstance(results, list) or not results:
+        return None, "markets/all returned no matching market (sy unavailable)"
+    first = results[0]
+    if not isinstance(first, Mapping):
+        return None, "markets/all result entry has unexpected shape"
+    sy_field = first.get("sy")
+    sy_address = parse_sy_address(sy_field)
+    if sy_address is None:
+        return None, f"markets/all sy field unparseable: {sy_field!r}"
+    return sy_address, None
+
+
+def _compute_ui_vs_chain_ratio(*, ui_value: Any, chain_value: float | None) -> float | None:
+    if chain_value is None or chain_value == 0:
+        return None
+    if not isinstance(ui_value, (int, float)):
+        return None
+    return float(ui_value) / chain_value
 
 
 @mcp.tool()
@@ -257,6 +404,15 @@ async def pendle_get_market_historical_data_v3(
     Notes:
     - `time_frame` accepts `hour`/`day`/`week` and aliases `1h`/`1d`/`1w` (auto-normalized before request).
     - `include_apy_breakdown` (v3 only) attaches APY breakdown sub-fields to the response.
+
+    APY field semantics — important: each time-series row's `underlyingApy` /
+    `baseApy` / `ytFloatingApy` / `aggregatedApy` is the same short-sliding-window
+    display value Pendle's `/v2/{chainId}/markets/{address}/data` returns at that
+    timestamp. It is **not** the chain's ground-truth APY at that point —
+    NAV-discrete / occasional-distribute underlyings get overstated 2-6× during
+    the post-pulse window. Use this endpoint for UI-shape series; for ground
+    truth call `SY.exchangeRate()` directly or use `pendle_get_market_data_v2`'s
+    injected `u_actual_30d_chain` (latest-only).
     """
     async with PendleApiClient.from_env() as client:
         return await client.get_market_historical_data_v3(
