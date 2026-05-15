@@ -24,13 +24,16 @@ any static cadence assumption would silently rot):
    cadence between the probe and latest; refine and probe again. Converges
    to ~1-block precision on ETH (12s exact) and ~hundreds-of-blocks
    precision on Arb / Base / BSC after one refinement.
-3. Narrow bisect on the residual bracket (3-6 probes vs ~25 on a naive
-   `[1, latest_block]` bisect).
+3. Cadence-guided bisect on the residual bracket: `mid = lo +
+   (target_ts - lo_ts) / cadence` (Newton step inside the bisect) instead
+   of the standard `mid = (lo + hi) / 2`. Converges in 1-5 probes even on
+   brackets that are millions of blocks wide; degrades to standard bisect
+   if cadence is wildly off (still advances ≥ 1 block per probe).
 4. The two `SY.exchangeRate()` reads at `latest_block` and the resolved
-   30d-ago block run in parallel.
+   30d-ago block run in parallel via `asyncio.gather`.
 
-Typical cost: 8-10 RPC calls vs 28-30 from naive bisect — ~3× fewer
-round-trips, which dominates wall-clock latency on this code path.
+Typical cost: 6 RPC calls on ETH-cadence chains, ~10 on faster ones like
+Arbitrum — vs ~28-30 on a naive `[1, latest_block]` bisect.
 
 The module exposes one entry point — `compute_u_actual_30d_chain` — that
 returns `(value, error)` with exactly one populated.
@@ -303,8 +306,9 @@ async def compute_u_actual_30d_chain(
     `(rate_now / rate_30d_ago - 1) × 365 / 30`.
 
     The `http_client` parameter is injectable for tests; in production we
-    open and close a fresh client per call. Cost: ~log2(latest_block) + 4
-    RPC calls (≈30 on major chains).
+    open and close a fresh client per call. Typical cost: 6-10 RPC calls
+    (~1-2s wall-clock) thanks to Newton-style cadence estimation + the
+    cadence-guided bisect described in this module's top docstring.
     """
     rpc_url = load_rpc_url(chain_id)
     if rpc_url is None:

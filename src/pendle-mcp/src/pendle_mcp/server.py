@@ -283,9 +283,10 @@ async def pendle_get_market_data_v2(
     Calibration requires an archive RPC at `RPC_URL_<chainId>` env var
     (Etherscan's `module=proxy` eth_call always returns latest state for
     historical blocks, so we deliberately do not fall back to it). The 30d-ago
-    block is found via binary search on `eth_getBlockByNumber` timestamps —
-    cost ≈ `log2(latest_block) + 4` RPC calls — so it works on any chain
-    Pendle lists (HyperEVM, Berachain, …) without a hardcoded block-time table.
+    block is located via Newton-style cadence estimation + cadence-guided
+    bisect on `eth_getBlockByNumber` timestamps — typically 6-10 RPC calls
+    (~1-2s wall-clock) on any chain Pendle lists (HyperEVM, Berachain, …)
+    without a hardcoded block-time table.
 
     Caveat: this calibration assumes the SY's yield accrues into
     `SY.exchangeRate()` (the standard interest-bearing model). For SYs that
