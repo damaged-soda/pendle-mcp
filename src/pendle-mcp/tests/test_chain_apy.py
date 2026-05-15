@@ -76,8 +76,8 @@ def _make_chain_rpc_handler(
     call_log: list[str] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
     """Build a synthetic-chain RPC handler:
-    - `eth_blockNumber` always returns `latest_block`.
-    - `eth_getBlockByNumber(N)` returns `{timestamp: genesis_ts + N * block_time}`.
+    - `eth_getBlockByNumber("latest")` returns header for `latest_block`.
+    - `eth_getBlockByNumber(hex_N)` returns `{number, timestamp = genesis_ts + N * block_time}`.
     - `eth_call(SY, exchangeRate())` returns `rate_at[block_number]` (raw uint256).
     """
 
@@ -100,7 +100,10 @@ def _make_chain_rpc_handler(
             params = payload.get("params") or []
             block_tag, include_txs = params
             assert include_txs is False
-            block_number = int(block_tag, 16)
+            if block_tag == "latest":
+                block_number = latest_block
+            else:
+                block_number = int(block_tag, 16)
             ts = block_ts(block_number)
             return httpx.Response(
                 200,
@@ -182,12 +185,15 @@ async def test_compute_u_actual_30d_chain_happy_path(monkeypatch: pytest.MonkeyP
     assert value is not None
     assert value == pytest.approx(0.0407, abs=1e-4)
 
-    # Sanity-check the call pattern: 1 eth_blockNumber + bisect probes + 2 eth_calls.
-    assert call_log.count("eth_blockNumber") == 1
+    # Sanity-check the call pattern: 0 eth_blockNumber (folded into the
+    # `latest` header call), 2 eth_call (parallelized), and Newton +
+    # cadence-guided bisect should converge to 3-5 eth_getBlockByNumber on
+    # any chain regardless of cadence. On exact 12s/block, Newton lands
+    # the answer in 1 probe + 1 cadence-guided bisect step to confirm
+    # boundary = 1 (header) + 1 (Newton) + 1 (bisect) = 3.
+    assert call_log.count("eth_blockNumber") == 0
     assert call_log.count("eth_call") == 2
-    # Bisect cost is bounded by log2(latest_block) + 1 (genesis check) + 1
-    # (latest ts). On 25M blocks that's ≤ 27. Keep the bound loose.
-    assert call_log.count("eth_getBlockByNumber") <= 30
+    assert call_log.count("eth_getBlockByNumber") <= 5
 
 
 @pytest.mark.asyncio
@@ -318,13 +324,9 @@ async def test_compute_u_actual_30d_chain_empty_eth_call_result(
         payload = json.loads(request.content)
         rpc_id = payload.get("id", 1)
         method = payload.get("method")
-        if method == "eth_blockNumber":
-            return httpx.Response(
-                200, json={"jsonrpc": "2.0", "id": rpc_id, "result": hex(latest_block)}
-            )
         if method == "eth_getBlockByNumber":
             block_tag = payload["params"][0]
-            n = int(block_tag, 16)
+            n = latest_block if block_tag == "latest" else int(block_tag, 16)
             return httpx.Response(
                 200,
                 json={
