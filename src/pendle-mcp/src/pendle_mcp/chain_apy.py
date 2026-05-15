@@ -5,16 +5,23 @@ Pendle's hosted `underlyingApy` (and the wider family `baseApy` /
 display value — it annualizes recent `SY.exchangeRate` growth, which makes
 NAV-discrete / occasional-distribute underlyings look 2-6× their sustained
 rate (see pendle-research finding 26). This module reads `SY.exchangeRate()`
-at `latest` and at `latest - 30d` via JSON-RPC and emits an annualized 30d
-window APY (`u_actual_30d_chain`) callers can use as ground truth.
+at `latest` and at the largest block whose timestamp is at or before
+`latest_ts - 30d` (found via JSON-RPC `eth_getBlockByNumber` binary search),
+and emits an annualized 30d window APY (`u_actual_30d_chain`) callers can
+use as ground truth.
 
 Requirements:
 - An archive RPC reachable via `RPC_URL_<chainid>` env var. Etherscan's
   `module=proxy` eth_call always returns latest state for historical blocks,
   so we deliberately do NOT fall back to it.
-- A block-time entry for the chain (see `_BLOCK_TIME_SECONDS`). Lookback
-  block is estimated as `latest - round(30d / block_time)`; ±10min
-  wall-clock drift over 30d shifts the APY by < 0.01pp.
+
+Approach:
+- Bisect on block timestamps rather than carrying a chain-keyed block-time
+  table — Pendle keeps adding chains (HyperEVM, Berachain, …) and any
+  static cadence assumption would silently rot. Bisect is ~log2(latest)
+  extra RPC calls (≈25-30 on major chains, ~2-3s wall time), in exchange
+  for correctness across every chain Pendle ever lists and ±1-block target
+  precision instead of the ±10-minute drift a fixed-cadence estimate gives.
 
 The module exposes one entry point — `compute_u_actual_30d_chain` — that
 returns `(value, error)` with exactly one populated.
@@ -35,24 +42,6 @@ _THIRTY_DAYS_SECONDS = 30 * 86400
 _EXCHANGE_RATE_SELECTOR = "0x3ba0b9a9"
 
 _DEFAULT_RPC_TIMEOUT_SECONDS = 15.0
-
-
-# Mean block production cadence per chain (seconds/block). Used only to estimate
-# the 30d-ago block; ±5% drift is invisible at APY precision because the window
-# is multiplicative (30d apart vs 30d ± a few minutes is rounding noise).
-_BLOCK_TIME_SECONDS: dict[int, float] = {
-    1: 12.0,        # Ethereum mainnet
-    10: 2.0,        # Optimism
-    56: 3.0,        # BNB Chain
-    137: 2.1,       # Polygon PoS
-    146: 1.0,       # Sonic
-    250: 1.0,       # Fantom Opera
-    5000: 2.0,      # Mantle
-    8453: 2.0,      # Base
-    42161: 0.25,    # Arbitrum One
-    81457: 2.0,     # Blast
-    534352: 3.0,    # Scroll
-}
 
 
 class _RpcError(RuntimeError):
@@ -82,18 +71,6 @@ def parse_sy_address(sy_field: Any) -> str | None:
     if not address.startswith("0x") or len(address) != 42:
         return None
     return address
-
-
-def estimate_blocks_back(chain_id: int, seconds: int) -> int | None:
-    block_time = _BLOCK_TIME_SECONDS.get(chain_id)
-    if block_time is None or block_time <= 0:
-        return None
-    return int(round(seconds / block_time))
-
-
-def known_chain_ids() -> list[int]:
-    """Chains we can estimate a 30d-ago block for."""
-    return sorted(_BLOCK_TIME_SECONDS.keys())
 
 
 async def _rpc_call(
@@ -127,6 +104,86 @@ async def _eth_block_number(client: httpx.AsyncClient, rpc_url: str) -> int:
     if not isinstance(result, str) or not result.startswith("0x"):
         raise _RpcError(f"eth_blockNumber returned unexpected result: {result!r}")
     return int(result, 16)
+
+
+async def _eth_get_block_timestamp(
+    client: httpx.AsyncClient, rpc_url: str, block_number: int
+) -> int:
+    """Fetch the unix timestamp of a specific block (header-only, no txs)."""
+    result = await _rpc_call(
+        client,
+        rpc_url,
+        "eth_getBlockByNumber",
+        [hex(block_number), False],
+    )
+    if result is None:
+        raise _RpcError(f"block {block_number} not found")
+    if not isinstance(result, dict):
+        raise _RpcError(
+            f"eth_getBlockByNumber returned unexpected shape: {type(result).__name__}"
+        )
+    ts_hex = result.get("timestamp")
+    if not isinstance(ts_hex, str) or not ts_hex.startswith("0x"):
+        raise _RpcError(f"eth_getBlockByNumber block timestamp not hex: {ts_hex!r}")
+    return int(ts_hex, 16)
+
+
+async def _find_block_at_or_before_timestamp(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    *,
+    target_ts: int,
+    latest_block: int,
+    latest_ts: int,
+) -> int:
+    """Largest block N in [1, latest_block] with `block(N).timestamp <= target_ts`.
+
+    Plain bisect on `eth_getBlockByNumber` timestamps. Costs ~log2(latest_block)
+    RPC calls (25-30 on major chains). Raises `_RpcError` if the chain doesn't
+    have ≥30d of history (or its earliest blocks are unqueryable).
+
+    We use block 1 — not block 0 — as the lower bound: some chains reject
+    `eth_getBlockByNumber(0)` (HyperEVM returns "invalid block height: 0"),
+    and using block 1 avoids that without affecting precision (block 0 is
+    only useful when the target ts is at genesis, which is the
+    chain-too-young case we want to fail out anyway).
+    """
+    if target_ts >= latest_ts:
+        return latest_block
+
+    # Fail-fast: if block 1 is itself younger than target_ts, the chain
+    # doesn't have ≥30d of history. This also seeds the bisect bracket
+    # with a known `lo_ts`, saving the cost of a redundant probe later.
+    lo: int = 1
+    lo_ts: int | None = None
+    try:
+        lo_ts = await _eth_get_block_timestamp(client, rpc_url, 1)
+        if lo_ts > target_ts:
+            raise _RpcError(
+                f"chain too young: block 1 ts {lo_ts} > target ts {target_ts} "
+                "(need ≥30d of history for calibration)"
+            )
+    except _RpcError as e:
+        if "too young" in str(e):
+            raise
+        # Block 1 unqueryable (extremely rare); proceed without the seed,
+        # bisect will probe higher blocks. lo_ts remains None.
+
+    hi = latest_block
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        mid_ts = await _eth_get_block_timestamp(client, rpc_url, mid)
+        if mid_ts <= target_ts:
+            lo, lo_ts = mid, mid_ts
+        else:
+            hi = mid
+
+    if lo_ts is None:
+        raise _RpcError(
+            f"chain too young or earliest blocks unqueryable: no block at or "
+            f"before target ts {target_ts}"
+        )
+    return lo
 
 
 async def _eth_call_exchange_rate(
@@ -171,29 +228,27 @@ async def compute_u_actual_30d_chain(
     `(rate_now / rate_30d_ago - 1) × 365 / 30`.
 
     The `http_client` parameter is injectable for tests; in production we
-    open and close a fresh client per call.
+    open and close a fresh client per call. Cost: ~log2(latest_block) + 4
+    RPC calls (≈30 on major chains).
     """
     rpc_url = load_rpc_url(chain_id)
     if rpc_url is None:
         return None, f"RPC_URL_{chain_id} not configured, cannot calibrate"
-
-    blocks_back = estimate_blocks_back(chain_id, _THIRTY_DAYS_SECONDS)
-    if blocks_back is None:
-        return None, (
-            f"no block-time entry for chain {chain_id}; cannot estimate 30d-ago block"
-        )
 
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient(timeout=rpc_timeout_seconds)
     try:
         try:
             latest_block = await _eth_block_number(client, rpc_url)
-            past_block = latest_block - blocks_back
-            if past_block <= 0:
-                return None, (
-                    f"chain {chain_id} too young: latest={latest_block}, "
-                    f"30d-ago block would be {past_block}"
-                )
+            latest_ts = await _eth_get_block_timestamp(client, rpc_url, latest_block)
+            target_ts = latest_ts - _THIRTY_DAYS_SECONDS
+            past_block = await _find_block_at_or_before_timestamp(
+                client,
+                rpc_url,
+                target_ts=target_ts,
+                latest_block=latest_block,
+                latest_ts=latest_ts,
+            )
             rate_now_raw = await _eth_call_exchange_rate(
                 client, rpc_url, sy_address, latest_block
             )

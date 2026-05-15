@@ -126,3 +126,60 @@ def test_extract_sy_address_handles_bad_shapes() -> None:
     )
     assert sy_addr == "0xbf98480425a29197e5d99d003017f63a1e595d02"
     assert err is None
+
+
+def test_extract_sy_address_when_meta_lookup_raised_an_exception() -> None:
+    """When `markets/all` fails inside the best-effort gather, the exception
+    arrives here as `market_meta`; we should surface it as a calibration error
+    rather than letting it bubble up and break the main tool response."""
+    from pendle_mcp.pendle_api import PendleApiError
+
+    sy_addr, err = server._extract_sy_address(
+        PendleApiError(
+            "rate limited",
+            error_type="rate_limited",
+            status_code=429,
+            method="GET",
+            path="/v2/markets/all",
+        )
+    )
+    assert sy_addr is None
+    assert err is not None
+    assert "markets/all lookup failed" in err
+    assert "rate_limited" in err
+
+    sy_addr, err = server._extract_sy_address(RuntimeError("network down"))
+    assert sy_addr is None
+    assert err is not None
+    assert "markets/all lookup failed: RuntimeError: network down" in err
+
+
+@pytest.mark.asyncio
+async def test_attach_chain_calibration_meta_failure_does_not_break_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full path: even when markets/all raised, the main response keeps all
+    its keys + gets the standard calibration triplet (with `_chain_error`
+    explaining the markets/all failure)."""
+    called = False
+
+    async def fake_compute(**_: Any) -> tuple[float | None, str | None]:
+        nonlocal called
+        called = True
+        return None, "should not be called"
+
+    monkeypatch.setattr(server, "compute_u_actual_30d_chain", fake_compute)
+
+    data: dict[str, Any] = {"underlyingApy": 0.04, "impliedApy": 0.05}
+    out = await server._attach_chain_calibration(
+        data=data,
+        chain_id=1,
+        market_meta=RuntimeError("backend on fire"),
+    )
+    assert called is False
+    assert out["underlyingApy"] == 0.04
+    assert out["impliedApy"] == 0.05
+    assert out["u_actual_30d_chain"] is None
+    assert out["u_ui_vs_chain_ratio"] is None
+    assert "markets/all lookup failed" in out["u_actual_chain_error"]
+    assert "backend on fire" in out["u_actual_chain_error"]

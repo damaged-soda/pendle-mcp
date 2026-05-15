@@ -274,15 +274,30 @@ async def pendle_get_market_data_v2(
       Diagnostic: 1.0 ≈ UI matches chain; > 1.5 strongly suggests the underlying
       is event-pulsed and UI is in the post-pulse sliding-window tail.
     - `u_actual_chain_error`: str — present only when `u_actual_30d_chain` is
-      None; explains why (missing `RPC_URL_<chainId>`, unknown chain block time,
-      contract revert, …).
+      None; explains why (missing `RPC_URL_<chainId>`, chain too young for a 30d
+      window, contract revert, markets/all lookup failure, …).
 
     Calibration requires an archive RPC at `RPC_URL_<chainId>` env var
     (Etherscan's `module=proxy` eth_call always returns latest state for
-    historical blocks, so we deliberately do not fall back to it).
+    historical blocks, so we deliberately do not fall back to it). The 30d-ago
+    block is found via binary search on `eth_getBlockByNumber` timestamps —
+    cost ≈ `log2(latest_block) + 4` RPC calls — so it works on any chain
+    Pendle lists (HyperEVM, Berachain, …) without a hardcoded block-time table.
+
+    Caveat: this calibration assumes the SY's yield accrues into
+    `SY.exchangeRate()` (the standard interest-bearing model). For SYs that
+    instead distribute yield via separate reward tokens (e.g. some HyperEVM
+    LST wrappers), `u_actual_30d_chain` may come back at ~0 even when the UI
+    `underlyingApy` is non-trivial — that's not a calibration bug, it's the
+    SY using a reward-distribution model the `exchangeRate()` accumulator
+    doesn't capture.
     """
     market_id = f"{chain_id}-{address}"
     async with PendleApiClient.from_env() as client:
+        # markets/all is best-effort — its only job is to give us the SY
+        # address for chain calibration. A 429 / 5xx / network blip there
+        # must not break the main data response; it becomes a calibration
+        # error and gets surfaced via `u_actual_chain_error`.
         data, market_meta = await asyncio.gather(
             client.get_market_data_v2(
                 chain_id=chain_id,
@@ -290,7 +305,10 @@ async def pendle_get_market_data_v2(
                 timestamp=timestamp,
             ),
             client.get_markets_all(chain_id=chain_id, ids=[market_id]),
+            return_exceptions=True,
         )
+    if isinstance(data, BaseException):
+        raise data
 
     return await _attach_chain_calibration(
         data=data,
@@ -334,7 +352,14 @@ async def _attach_chain_calibration(
 
 def _extract_sy_address(market_meta: Any) -> tuple[str | None, str | None]:
     """Pull the SY address out of a `/v2/markets/all` response. Returns
-    `(sy_address, error)`."""
+    `(sy_address, error)`. Handles the case where `market_meta` is itself an
+    exception (best-effort markets/all call failed in `asyncio.gather`)."""
+    if isinstance(market_meta, BaseException):
+        if isinstance(market_meta, PendleApiError):
+            return None, f"markets/all lookup failed: {market_meta.summary()}"
+        return None, (
+            f"markets/all lookup failed: {type(market_meta).__name__}: {market_meta}"
+        )
     if not isinstance(market_meta, Mapping):
         return None, "markets/all lookup returned unexpected shape"
     results = market_meta.get("results")
