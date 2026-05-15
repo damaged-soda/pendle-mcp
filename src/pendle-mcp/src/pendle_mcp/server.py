@@ -14,8 +14,9 @@ reference samples.
 
 For ground truth, `pendle_get_market_data_v2` always attaches
 `u_actual_30d_chain` (and the diagnostic `u_ui_vs_chain_ratio`) computed by
-reading `SY.exchangeRate()` at `latest` and `latest - 30d` via
-`RPC_URL_<chainid>` — see `pendle_mcp.chain_apy`.
+reading `SY.exchangeRate()` at `latest_block` and at the largest block whose
+timestamp is at or before `latest_ts - 30d` (found via `eth_getBlockByNumber`
+bisect on `RPC_URL_<chainid>`) — see `pendle_mcp.chain_apy`.
 """
 
 from __future__ import annotations
@@ -264,7 +265,9 @@ async def pendle_get_market_data_v2(
       accrual underlyings (Ethena sUSDe etc.) happen to track ground truth
       within ~15% but this is a property of the underlying, not the field.
     - For ground truth use `u_actual_30d_chain` (always attached below) or call
-      `SY.exchangeRate()` yourself across `latest` vs `latest - 30d` blocks.
+      `SY.exchangeRate()` yourself across `latest_block` vs the block at
+      `latest_ts - 30d` (found via `eth_getBlockByNumber` timestamp bisect, not
+      a fixed block-count offset — chain cadence varies).
 
     Extra fields this tool injects (always present, even when calibration fails):
     - `u_actual_30d_chain`: float | None — on-chain annualized 30d window APY,
