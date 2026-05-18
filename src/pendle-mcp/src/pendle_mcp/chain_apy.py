@@ -47,8 +47,9 @@ from typing import Any
 
 import httpx
 
-# 30 days in seconds — the lookback window for the on-chain calibration.
-_THIRTY_DAYS_SECONDS = 30 * 86400
+# 30 days — the default lookback window for the on-chain calibration.
+_THIRTY_DAYS = 30
+_SECONDS_PER_DAY = 86400
 
 # keccak256("exchangeRate()")[:4]. Standard Pendle SY interface; emits the
 # accumulator that grows monotonically with underlying yield.
@@ -292,24 +293,28 @@ async def _eth_call_exchange_rate(
         raise _RpcError(f"eth_call result is not hex: {result!r}") from e
 
 
-async def compute_u_actual_30d_chain(
+async def compute_u_actual_chain(
     *,
     chain_id: int,
     sy_address: str,
+    window_days: int = _THIRTY_DAYS,
     rpc_timeout_seconds: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
     http_client: httpx.AsyncClient | None = None,
 ) -> tuple[float | None, str | None]:
-    """Compute on-chain 30d annualized APY for a Pendle SY token.
+    """Compute on-chain annualized APY for a Pendle SY token.
 
     Returns `(value, error)` — exactly one is `None`. `value` is a decimal
     (e.g. `0.0407` for 4.07%); annualization is linear:
-    `(rate_now / rate_30d_ago - 1) × 365 / 30`.
+    `(rate_now / rate_window_ago - 1) × 365 / window_days`.
 
     The `http_client` parameter is injectable for tests; in production we
     open and close a fresh client per call. Typical cost: 6-10 RPC calls
     (~1-2s wall-clock) thanks to Newton-style cadence estimation + the
     cadence-guided bisect described in this module's top docstring.
     """
+    if window_days <= 0:
+        return None, f"window_days must be positive, got {window_days}"
+
     rpc_url = load_rpc_url(chain_id)
     if rpc_url is None:
         return None, f"RPC_URL_{chain_id} not configured, cannot calibrate"
@@ -321,7 +326,7 @@ async def compute_u_actual_30d_chain(
             latest_block, latest_ts = await _eth_get_block_header(
                 client, rpc_url, "latest"
             )
-            target_ts = latest_ts - _THIRTY_DAYS_SECONDS
+            target_ts = latest_ts - window_days * _SECONDS_PER_DAY
             past_block = await _find_block_at_or_before_timestamp(
                 client,
                 rpc_url,
@@ -340,8 +345,31 @@ async def compute_u_actual_30d_chain(
             await client.aclose()
 
     if rate_past_raw == 0:
-        return None, "30d-ago exchange rate is zero (SY may not have been deployed)"
+        return None, (
+            f"{window_days}d-ago exchange rate is zero (SY may not have been deployed)"
+        )
 
     ratio = rate_now_raw / rate_past_raw
-    apy = (ratio - 1.0) * 365.0 / 30.0
+    apy = (ratio - 1.0) * 365.0 / window_days
     return apy, None
+
+
+async def compute_u_actual_30d_chain(
+    *,
+    chain_id: int,
+    sy_address: str,
+    rpc_timeout_seconds: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
+    http_client: httpx.AsyncClient | None = None,
+) -> tuple[float | None, str | None]:
+    """Compute on-chain 30d annualized APY for a Pendle SY token.
+
+    Backward-compatible wrapper kept for the existing `pendle_get_market_data_v2`
+    calibration field.
+    """
+    return await compute_u_actual_chain(
+        chain_id=chain_id,
+        sy_address=sy_address,
+        window_days=_THIRTY_DAYS,
+        rpc_timeout_seconds=rpc_timeout_seconds,
+        http_client=http_client,
+    )

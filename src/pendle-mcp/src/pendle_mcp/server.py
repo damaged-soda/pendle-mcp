@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import datetime as dt
 import io
 import time
 from typing import Any, Mapping
 
-from pendle_mcp.chain_apy import compute_u_actual_30d_chain, parse_sy_address
+from pendle_mcp.chain_apy import (
+    compute_u_actual_30d_chain,
+    compute_u_actual_chain,
+    parse_sy_address,
+)
 from pendle_mcp.pendle_api import (
     PendleApiClient,
     PendleApiError,
@@ -54,12 +59,76 @@ _PNL_SUMMARY_DEFAULT_PAGE_SIZE = 100
 # trip in normal use; if it does, the tool raises so callers can't be misled
 # by a partial summary that *looks* complete.
 _PNL_SUMMARY_HARD_CAP_ROWS = 10000
+_MARKETS_ALL_PAGE_SIZE = 100
+_NEW_MARKET_OPPORTUNITY_DEFAULT_CALIBRATION_CONCURRENCY = 2
 
 
 def _coerce_float(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return 0.0
+
+
+def _parse_iso_datetime(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _days_between(now: dt.datetime, past: dt.datetime | None) -> float | None:
+    if past is None:
+        return None
+    return (now - past).total_seconds() / 86400.0
+
+
+def _days_until(future: dt.datetime | None, now: dt.datetime) -> float | None:
+    if future is None:
+        return None
+    return (future - now).total_seconds() / 86400.0
+
+
+def _extract_market_address(market: Mapping[str, Any]) -> str | None:
+    address = market.get("address")
+    if isinstance(address, str) and address.startswith("0x") and len(address) == 42:
+        return address.lower()
+    return None
+
+
+def _market_float(market: Mapping[str, Any], key: str) -> float | None:
+    details = market.get("details")
+    if not isinstance(details, Mapping):
+        return None
+    value = details.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _market_tvl_usd(market: Mapping[str, Any]) -> float | None:
+    return _market_float(market, "totalTvl")
+
+
+def _market_underlying_apy(market: Mapping[str, Any]) -> float | None:
+    return _market_float(market, "underlyingApy")
+
+
+def _market_implied_apy(market: Mapping[str, Any]) -> float | None:
+    return _market_float(market, "impliedApy")
+
+
+def _bps(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value * 10_000.0
 
 
 def _flatten_pnl_row(row: Mapping[str, Any]) -> dict[str, float]:
@@ -244,6 +313,295 @@ async def pendle_get_markets_points_market(
             chain_id=chain_id,
             is_active=is_active,
         )
+
+
+async def _fetch_all_markets(
+    client: PendleApiClient,
+    *,
+    chain_id: int,
+    is_active: bool = True,
+) -> list[Mapping[str, Any]]:
+    markets: list[Mapping[str, Any]] = []
+    skip = 0
+    while True:
+        page = await client.get_markets_all(
+            chain_id=chain_id,
+            is_active=is_active,
+            skip=skip,
+            limit=_MARKETS_ALL_PAGE_SIZE,
+        )
+        if not isinstance(page, Mapping):
+            break
+        results = page.get("results")
+        if not isinstance(results, list) or not results:
+            break
+        markets.extend(row for row in results if isinstance(row, Mapping))
+        if len(results) < _MARKETS_ALL_PAGE_SIZE:
+            break
+        total = page.get("total")
+        if isinstance(total, int) and len(markets) >= total:
+            break
+        skip += len(results)
+    return markets
+
+
+def _prefilter_new_market_opportunity_candidates(
+    markets: list[Mapping[str, Any]],
+    *,
+    now: dt.datetime,
+    market_age_days: int,
+    min_tvl_usd: float,
+) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
+    candidates: list[Mapping[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for market in markets:
+        address = _extract_market_address(market)
+        name = market.get("name") if isinstance(market.get("name"), str) else None
+        created_at = _parse_iso_datetime(market.get("timestamp"))
+        age_days = _days_between(now, created_at)
+        tvl_usd = _market_tvl_usd(market)
+        sy_address = parse_sy_address(market.get("sy"))
+
+        reason: str | None = None
+        if address is None:
+            reason = "bad_market_address"
+        elif created_at is None or age_days is None:
+            reason = "missing_or_bad_created_at"
+        elif age_days > market_age_days:
+            reason = "market_too_old"
+        elif tvl_usd is None:
+            reason = "missing_tvl"
+        elif tvl_usd < min_tvl_usd:
+            reason = "tvl_below_threshold"
+        elif sy_address is None:
+            reason = "missing_or_bad_sy"
+
+        if reason is None:
+            candidates.append(market)
+        else:
+            skipped.append(
+                {
+                    "market_id": address,
+                    "market_name": name,
+                    "reason": reason,
+                    "market_age_days": age_days,
+                    "tvl_usd": tvl_usd,
+                }
+            )
+    return candidates, skipped
+
+
+async def _build_new_market_opportunity_row(
+    market: Mapping[str, Any],
+    *,
+    chain_id: int,
+    now: dt.datetime,
+    chain_truth_window_days: int,
+    spread_threshold_bps: int,
+    implied_discount_threshold_bps: int,
+) -> dict[str, Any]:
+    address = _extract_market_address(market)
+    sy_address = parse_sy_address(market.get("sy"))
+    created_at = _parse_iso_datetime(market.get("timestamp"))
+    expiry = _parse_iso_datetime(market.get("expiry"))
+    u_ui = _market_underlying_apy(market)
+    implied = _market_implied_apy(market)
+    tvl_usd = _market_tvl_usd(market)
+
+    row: dict[str, Any] = {
+        "market_id": address,
+        "market_name": market.get("name"),
+        "chain_id": chain_id,
+        "created_at": created_at.isoformat().replace("+00:00", "Z")
+        if created_at is not None
+        else None,
+        "market_age_days": _days_between(now, created_at),
+        "expiry": expiry.isoformat().replace("+00:00", "Z") if expiry is not None else None,
+        "ttm_days": _days_until(expiry, now),
+        "sy": market.get("sy"),
+        "u_ui_pendle": u_ui,
+        "implied_apy": implied,
+        "tvl_usd": tvl_usd,
+        "is_new": market.get("isNew"),
+        "is_prime": market.get("isPrime"),
+        "is_volatile": market.get("isVolatile"),
+        "categories": market.get("categoryIds"),
+        "chain_truth_window_days": chain_truth_window_days,
+        "spread_threshold_bps": spread_threshold_bps,
+        "implied_discount_threshold_bps": implied_discount_threshold_bps,
+        "trigger_reasons": [],
+    }
+
+    if sy_address is None:
+        row["u_chain_long"] = None
+        row["chain_truth_error"] = f"market sy field unparseable: {market.get('sy')!r}"
+        row["is_opportunity"] = False
+        return row
+
+    value, error = await compute_u_actual_chain(
+        chain_id=chain_id,
+        sy_address=sy_address,
+        window_days=chain_truth_window_days,
+    )
+    row["u_chain_long"] = value
+    if error is not None:
+        row["chain_truth_error"] = error
+        row["is_opportunity"] = False
+        return row
+
+    ui_spread = value - u_ui if value is not None and u_ui is not None else None
+    implied_discount = value - implied if value is not None and implied is not None else None
+    row["ui_spread_bps"] = _bps(ui_spread)
+    row["implied_discount_bps"] = _bps(implied_discount)
+    row["ui_vs_chain_ratio"] = (u_ui / value) if value and u_ui is not None else None
+    row["implied_vs_chain_ratio"] = (implied / value) if value and implied is not None else None
+
+    trigger_reasons: list[str] = []
+    if row["ui_spread_bps"] is not None and row["ui_spread_bps"] >= spread_threshold_bps:
+        trigger_reasons.append("ui_understates_chain_truth")
+    if (
+        row["implied_discount_bps"] is not None
+        and row["implied_discount_bps"] >= implied_discount_threshold_bps
+    ):
+        trigger_reasons.append("market_implied_below_chain_truth")
+    row["trigger_reasons"] = trigger_reasons
+    row["is_opportunity"] = bool(trigger_reasons)
+    return row
+
+
+async def _detect_new_market_opportunities(
+    *,
+    chain_id: int,
+    market_age_days: int,
+    chain_truth_window_days: int,
+    spread_threshold_bps: int,
+    implied_discount_threshold_bps: int,
+    min_tvl_usd: float,
+    include_non_opportunities: bool,
+    calibration_concurrency: int,
+) -> dict[str, Any]:
+    if market_age_days <= 0:
+        raise ValueError(f"market_age_days must be positive; got {market_age_days}.")
+    if chain_truth_window_days <= 0:
+        raise ValueError(
+            f"chain_truth_window_days must be positive; got {chain_truth_window_days}."
+        )
+    if spread_threshold_bps < 0:
+        raise ValueError(f"spread_threshold_bps must be >= 0; got {spread_threshold_bps}.")
+    if implied_discount_threshold_bps < 0:
+        raise ValueError(
+            "implied_discount_threshold_bps must be >= 0; "
+            f"got {implied_discount_threshold_bps}."
+        )
+    if min_tvl_usd < 0:
+        raise ValueError(f"min_tvl_usd must be >= 0; got {min_tvl_usd}.")
+    if calibration_concurrency <= 0:
+        raise ValueError(
+            f"calibration_concurrency must be positive; got {calibration_concurrency}."
+        )
+
+    now = dt.datetime.now(dt.timezone.utc)
+    async with PendleApiClient.from_env() as client:
+        markets = await _fetch_all_markets(client, chain_id=chain_id, is_active=True)
+
+    candidates, prefilter_skipped = _prefilter_new_market_opportunity_candidates(
+        markets,
+        now=now,
+        market_age_days=market_age_days,
+        min_tvl_usd=min_tvl_usd,
+    )
+    sem = asyncio.Semaphore(calibration_concurrency)
+
+    async def run_one(market: Mapping[str, Any]) -> dict[str, Any]:
+        async with sem:
+            return await _build_new_market_opportunity_row(
+                market,
+                chain_id=chain_id,
+                now=now,
+                chain_truth_window_days=chain_truth_window_days,
+                spread_threshold_bps=spread_threshold_bps,
+                implied_discount_threshold_bps=implied_discount_threshold_bps,
+            )
+
+    rows = await asyncio.gather(*(run_one(market) for market in candidates))
+    opportunities = [row for row in rows if row.get("is_opportunity")]
+    opportunities.sort(
+        key=lambda row: max(
+            row.get("ui_spread_bps") or float("-inf"),
+            row.get("implied_discount_bps") or float("-inf"),
+        ),
+        reverse=True,
+    )
+    non_opportunities = [row for row in rows if not row.get("is_opportunity")]
+
+    result: dict[str, Any] = {
+        "parameters": {
+            "chain_id": chain_id,
+            "market_age_days": market_age_days,
+            "chain_truth_window_days": chain_truth_window_days,
+            "spread_threshold_bps": spread_threshold_bps,
+            "implied_discount_threshold_bps": implied_discount_threshold_bps,
+            "min_tvl_usd": min_tvl_usd,
+        },
+        "snapshot_at": now.isoformat().replace("+00:00", "Z"),
+        "summary": {
+            "markets_scanned": len(markets),
+            "prefilter_candidates": len(candidates),
+            "opportunities": len(opportunities),
+            "chain_truth_errors": sum(1 for row in rows if row.get("chain_truth_error")),
+            "prefilter_skipped": len(prefilter_skipped),
+        },
+        "opportunities": opportunities,
+    }
+    if include_non_opportunities:
+        result["non_opportunities"] = non_opportunities
+        result["prefilter_skipped"] = prefilter_skipped
+    return result
+
+
+@mcp.tool()
+async def pendle_detect_new_market_opportunities(
+    *,
+    chain_id: int = 1,
+    market_age_days: int = 30,
+    chain_truth_window_days: int = 90,
+    spread_threshold_bps: int = 200,
+    implied_discount_threshold_bps: int = 50,
+    min_tvl_usd: float = 500_000,
+    include_non_opportunities: bool = False,
+    calibration_concurrency: int = _NEW_MARKET_OPPORTUNITY_DEFAULT_CALIBRATION_CONCURRENCY,
+) -> Any:
+    """Detect new Pendle markets where longer-window chain truth is not priced in.
+
+    This is a manual scanner, not a cron/alarm tool. It fetches active markets,
+    filters to young + liquid markets, reads each candidate SY.exchangeRate()
+    over a configurable long window (default 90d), then flags markets where:
+
+    - `u_chain_long - u_ui_pendle >= spread_threshold_bps`, or
+    - `u_chain_long - implied_apy >= implied_discount_threshold_bps`.
+
+    The second trigger is deliberately separate because the savUSD case can
+    remain actionable even after Pendle's UI APY catches up: the trade only
+    exists if the market's implied APY is still below the protocol forward rate.
+
+    Requirements:
+    - archive RPC at `RPC_URL_<chainId>` for historical SY.exchangeRate calls.
+    - `chain_truth_window_days` must not exceed the SY's historical readable
+      lifetime; otherwise the row returns `chain_truth_error` and is not flagged.
+
+    Returns `{parameters, snapshot_at, summary, opportunities}`. Pass
+    `include_non_opportunities=true` for calibration/debug output.
+    """
+    return await _detect_new_market_opportunities(
+        chain_id=chain_id,
+        market_age_days=market_age_days,
+        chain_truth_window_days=chain_truth_window_days,
+        spread_threshold_bps=spread_threshold_bps,
+        implied_discount_threshold_bps=implied_discount_threshold_bps,
+        min_tvl_usd=min_tvl_usd,
+        include_non_opportunities=include_non_opportunities,
+        calibration_concurrency=calibration_concurrency,
+    )
 
 
 @mcp.tool()

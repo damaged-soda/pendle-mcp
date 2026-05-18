@@ -49,7 +49,7 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
 |------|-------|
 | Chains | `pendle_get_chains` |
 | Health | `pendle_health` |
-| Markets | `pendle_get_markets_all`（分页 v2）、`pendle_get_markets_points_market`、`pendle_get_market_data_v2`、`pendle_get_market_historical_data_v3` |
+| Markets | `pendle_get_markets_all`（分页 v2）、`pendle_get_markets_points_market`、`pendle_get_market_data_v2`、`pendle_get_market_historical_data_v3`、`pendle_detect_new_market_opportunities` |
 | Assets / Prices | `pendle_get_assets_all`、`pendle_get_asset_prices`、`pendle_get_prices_ohlcv_v4` |
 | Transactions | `pendle_get_user_pnl_transactions`、`pendle_get_user_pnl_summary`、`pendle_get_market_transactions_v5` |
 | PnL | `pendle_get_user_pnl_gained_positions` |
@@ -78,6 +78,10 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
   - `u_ui_vs_chain_ratio`: float | null —— `underlyingApy / u_actual_30d_chain`，diagnostic。≈ 1.0 说明 UI 跟链上对齐；> 1.5 强烈暗示 underlying 是 NAV-discrete / pulse 类，UI 处于 sliding window 残留高估区。
   - `u_actual_chain_error`: str —— 只在 `u_actual_30d_chain` 为 null 时出现，解释原因（缺 `RPC_URL_<chainId>`、chain 历史不足 30d、合约 revert、markets/all lookup 失败等）。
 - **链上校准的 RPC 约束**：需要 archive RPC，跟 etherscan-mcp 一致从 `RPC_URL_<chainid>` 读。Etherscan `module=proxy` 的 eth_call 永远返回 latest（即使传历史 block tag），所以**不会** fallback 到它 —— 没配 RPC 就直接报 error。30d-ago block 走 `eth_getBlockByNumber` timestamp 搜索（Newton 估算 + cadence-guided bisect，不维护静态 chain block-time 表，Pendle 新加链不改代码就能用）；实测 ETH 6 RPC / ~1s、Arb 10 RPC / ~1.3s。chain 历史 < 30d 时返回 `u_actual_chain_error="chain too young: ..."`。
+- **`pendle_detect_new_market_opportunities`**：手动扫描新 market 机会，不打飞书、不写 state。默认只看 `chain_id=1` / `market_age_days=30` / `min_tvl_usd=500000` 的 active market，读取每个候选 SY 的 `exchangeRate()` 做 `chain_truth_window_days=90` 长窗口链上 APY。触发条件有两条：
+  - `u_chain_long - u_ui_pendle >= spread_threshold_bps`（默认 200 bps）：找出 Pendle UI sliding-window 明显低估 chain truth 的新 market。
+  - `u_chain_long - implied_apy >= implied_discount_threshold_bps`（默认 50 bps）：找出 market implied APY 还没 price in 的候选。savUSD 当前更接近这一类 —— UI APY 会随时间追上，但只要 implied APY 仍低于 forward rate，H 交易仍可能有 spread。
+  - 返回 `{parameters, snapshot_at, summary, opportunities}`；调参 / 校准时可传 `include_non_opportunities=true` 看未触发行和 prefilter skip 原因，也可调 `calibration_concurrency` 控制 archive RPC 并发。依赖同一个 `RPC_URL_<chainid>` archive RPC；如果 90d 前 SY 不可读，会在该行返回 `chain_truth_error`。
 - **`pendle_get_prices_ohlcv_v4.parse_results`**：默认 `false`；开启后把响应里 `results` 的 CSV 串解析成 `results_parsed`（结构化数组、字符串字段保精度），解析失败会带 `parse_error`。
 - **`pendle_get_merkle_rewards`**：响应同时包含 `claimableRewards`（待领取）与 `claimedRewards`（已领取），取代旧的 `pendle_get_merkle_claimed_rewards`。
 - **`pendle_get_user_pnl_transactions`**：纯翻页器，原样透传 API 的 `{total, results}`，`skip` / `limit` 直接翻页。要"对一个地址做整体评估"用下面的 `pendle_get_user_pnl_summary`，不要在这个 tool 上手工累加 page。
