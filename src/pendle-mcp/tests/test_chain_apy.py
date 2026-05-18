@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from pendle_mcp.chain_apy import (
+    compute_u_actual_chain,
     compute_u_actual_30d_chain,
     load_rpc_url,
     parse_sy_address,
@@ -231,6 +232,54 @@ async def test_compute_u_actual_30d_chain_works_on_chain_without_predefined_bloc
 
     assert error is None
     assert value == pytest.approx(0.10, abs=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_compute_u_actual_chain_custom_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    rpc_url = "https://eth.example.com/v2/key"
+    sy = "0x" + "cd" * 20
+    monkeypatch.setenv("RPC_URL_1", rpc_url)
+
+    latest_block = 25_000_000
+    block_time = 12.0
+    genesis_ts = 1_438_269_988
+    window_days = 90
+    expected_past_block = latest_block - int(window_days * 86400 / block_time)
+
+    rate_past = 10**18
+    rate_now = int(rate_past * (1.0 + 0.074 * window_days / 365.0))
+
+    transport = httpx.MockTransport(
+        _make_chain_rpc_handler(
+            latest_block=latest_block,
+            block_time_seconds=block_time,
+            genesis_ts=genesis_ts,
+            sy_address=sy,
+            rate_at={latest_block: rate_now, expected_past_block: rate_past},
+            expect_url=rpc_url,
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        value, error = await compute_u_actual_chain(
+            chain_id=1,
+            sy_address=sy,
+            window_days=window_days,
+            http_client=http_client,
+        )
+
+    assert error is None
+    assert value == pytest.approx(0.074, abs=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_compute_u_actual_chain_rejects_bad_window() -> None:
+    value, error = await compute_u_actual_chain(
+        chain_id=1,
+        sy_address="0x" + "ab" * 20,
+        window_days=0,
+    )
+    assert value is None
+    assert error == "window_days must be positive, got 0"
 
 
 @pytest.mark.asyncio
