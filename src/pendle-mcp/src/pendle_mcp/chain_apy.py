@@ -42,8 +42,11 @@ returns `(value, error)` with exactly one populated.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import os
-from typing import Any
+import time
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 import httpx
 
@@ -54,12 +57,132 @@ _SECONDS_PER_DAY = 86400
 # keccak256("exchangeRate()")[:4]. Standard Pendle SY interface; emits the
 # accumulator that grows monotonically with underlying yield.
 _EXCHANGE_RATE_SELECTOR = "0x3ba0b9a9"
+_NAV_ORACLE_SELECTOR = "0x49d4640d"
+_NAV_REPORTED_TOPIC = (
+    "0x4b82b8834f3f7b776bcb5a777f77ea7aabcd427c3fa20fba6fb6887d99b0a17e"
+)
+
+_ZERO_ADDRESS = "0x" + "0" * 40
 
 _DEFAULT_RPC_TIMEOUT_SECONDS = 15.0
+_RPC_CAPABILITY_CACHE_TTL_SECONDS = 86400
+_LOG_CHUNK_SIZE_BLOCKS = 10_000
+
+_EVENT_LOG_FALLBACK_RPCS: dict[int, tuple[str, ...]] = {
+    999: ("https://rpc.hyperliquid.xyz/evm",),
+}
+
+
+@dataclass(frozen=True)
+class ChainTruthResult:
+    """Structured market chain-truth result for opportunity scanning.
+
+    `status="ok"` means `value` is usable. All other statuses are explicit
+    unknown/fail-closed states; callers must not treat them as zero yield.
+    """
+
+    value: float | None
+    status: str
+    method: str
+    confidence: str
+    error: str | None = None
+    notes: str | None = None
+    window_days: int | None = None
+    effective_window_days: float | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "value": self.value,
+            "status": self.status,
+            "method": self.method,
+            "confidence": self.confidence,
+        }
+        if self.error is not None:
+            out["error"] = self.error
+        if self.notes is not None:
+            out["notes"] = self.notes
+        if self.window_days is not None:
+            out["window_days"] = self.window_days
+        if self.effective_window_days is not None:
+            out["effective_window_days"] = self.effective_window_days
+        if self.diagnostics:
+            out["diagnostics"] = self.diagnostics
+        return out
+
+    @classmethod
+    def ok(
+        cls,
+        *,
+        value: float,
+        method: str,
+        confidence: str,
+        window_days: int,
+        effective_window_days: float | None = None,
+        notes: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> "ChainTruthResult":
+        return cls(
+            value=value,
+            status="ok",
+            method=method,
+            confidence=confidence,
+            window_days=window_days,
+            effective_window_days=effective_window_days,
+            notes=notes,
+            diagnostics=diagnostics or {},
+        )
+
+    @classmethod
+    def fail(
+        cls,
+        *,
+        status: str,
+        method: str,
+        error: str,
+        confidence: str = "none",
+        window_days: int | None = None,
+        notes: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> "ChainTruthResult":
+        return cls(
+            value=None,
+            status=status,
+            method=method,
+            confidence=confidence,
+            error=error,
+            window_days=window_days,
+            notes=notes,
+            diagnostics=diagnostics or {},
+        )
+
+
+@dataclass(frozen=True)
+class HistoricalStateCapability:
+    trusted: bool
+    status: str
+    error: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class _RpcError(RuntimeError):
     """Internal — surfaced through `(value, error)` tuple, never raised out."""
+
+
+class _BoundaryLogsReducedRange(RuntimeError):
+    def __init__(
+        self,
+        first: Mapping[str, Any] | None,
+        last: Mapping[str, Any] | None,
+    ) -> None:
+        super().__init__("eth_getLogs retry succeeded with reduced range")
+        self.first = first
+        self.last = last
+
+
+_HISTORICAL_STATE_CAPABILITY_CACHE: dict[
+    tuple[int, str, str], tuple[float, HistoricalStateCapability]
+] = {}
 
 
 def _rpc_url_env_name(chain_id: int) -> str:
@@ -74,6 +197,24 @@ def load_rpc_url(chain_id: int) -> str | None:
     return stripped or None
 
 
+def load_event_log_rpc_urls(chain_id: int) -> list[str]:
+    """Return primary RPC plus known event-log fallbacks for a chain.
+
+    The primary `RPC_URL_<chainid>` must be archive-state capable for
+    historical `eth_call`. Event-log adapters can safely fall back to
+    endpoints that support `eth_getLogs` even if historical state calls are
+    untrusted (e.g. HyperEVM official RPC).
+    """
+    urls: list[str] = []
+    primary = load_rpc_url(chain_id)
+    if primary is not None:
+        urls.append(primary)
+    for url in _EVENT_LOG_FALLBACK_RPCS.get(chain_id, ()):
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
 def parse_sy_address(sy_field: Any) -> str | None:
     """Pull the bare SY address out of a `<chainId>-<address>` Pendle id string."""
     if not isinstance(sy_field, str):
@@ -85,6 +226,18 @@ def parse_sy_address(sy_field: Any) -> str | None:
     if not address.startswith("0x") or len(address) != 42:
         return None
     return address
+
+
+def parse_chain_address(value: Any) -> str | None:
+    """Parse either `<chainId>-<address>` or a bare 0x address."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if "-" in text:
+        _, _, text = text.partition("-")
+    if text.startswith("0x") and len(text) == 42:
+        return text
+    return None
 
 
 async def _rpc_call(
@@ -111,6 +264,173 @@ async def _rpc_call(
     if "result" not in data:
         raise _RpcError("RPC response missing 'result'")
     return data["result"]
+
+
+async def _eth_get_code(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    address: str,
+    block_tag: str,
+) -> str:
+    result = await _rpc_call(client, rpc_url, "eth_getCode", [address, block_tag])
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise _RpcError(f"eth_getCode returned non-hex result: {result!r}")
+    return result.lower()
+
+
+async def _eth_call_selector(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    address: str,
+    selector: str,
+    block_tag: str = "latest",
+) -> str:
+    result = await _rpc_call(
+        client,
+        rpc_url,
+        "eth_call",
+        [{"to": address, "data": selector}, block_tag],
+    )
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise _RpcError(f"eth_call returned non-hex result: {result!r}")
+    if result == "0x":
+        raise _RpcError("eth_call returned empty data")
+    return result.lower()
+
+
+def _decode_address_word(result: str) -> str | None:
+    payload = result[2:]
+    if len(payload) < 64:
+        return None
+    address = "0x" + payload[-40:]
+    if address == _ZERO_ADDRESS:
+        return None
+    return address.lower()
+
+
+def _decode_uint256_word(data: str, index: int = 0) -> int:
+    payload = data[2:] if data.startswith("0x") else data
+    start = index * 64
+    word = payload[start : start + 64]
+    if len(word) != 64:
+        raise _RpcError(f"cannot decode uint256 word {index} from {data!r}")
+    return int(word, 16)
+
+
+async def _eth_get_logs(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    *,
+    address: str,
+    topic0: str,
+    from_block: int,
+    to_block: int,
+) -> list[Mapping[str, Any]]:
+    if from_block > to_block:
+        return []
+    result = await _rpc_call(
+        client,
+        rpc_url,
+        "eth_getLogs",
+        [
+            {
+                "address": address,
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "topics": [topic0],
+            }
+        ],
+    )
+    if not isinstance(result, list):
+        raise _RpcError(f"eth_getLogs returned unexpected shape: {type(result).__name__}")
+    return [row for row in result if isinstance(row, Mapping)]
+
+
+async def _eth_get_boundary_logs_chunked(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    *,
+    address: str,
+    topic0: str,
+    from_block: int,
+    to_block: int,
+    chunk_size: int = _LOG_CHUNK_SIZE_BLOCKS,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None, int]:
+    """Find first and last matching log without scanning the full window.
+
+    HyperEVM public RPCs cap `eth_getLogs` ranges (dRPC free tier: 10000
+    blocks; official RPC: 1000 blocks). NavOracle emits frequently, so probing
+    from both boundaries finds the usable event pair with a handful of requests
+    instead of scanning every chunk.
+    """
+    first: Mapping[str, Any] | None = None
+    last: Mapping[str, Any] | None = None
+    chunks_scanned = 0
+
+    async def read_logs(start_block: int, end_block: int) -> list[Mapping[str, Any]]:
+        nonlocal chunks_scanned
+        chunks_scanned += 1
+        try:
+            return await _eth_get_logs(
+                client,
+                rpc_url,
+                address=address,
+                topic0=topic0,
+                from_block=start_block,
+                to_block=end_block,
+            )
+        except _RpcError as e:
+            text = str(e).lower()
+            if chunk_size > 1000 and ("1000" in text or "range" in text):
+                smaller_first, smaller_last, smaller_chunks = (
+                    await _eth_get_boundary_logs_chunked(
+                        client,
+                        rpc_url,
+                        address=address,
+                        topic0=topic0,
+                        from_block=from_block,
+                        to_block=to_block,
+                        chunk_size=1000,
+                    )
+                )
+                chunks_scanned += smaller_chunks
+                # A private exception lets the outer function return the result
+                # from the reduced-range retry without duplicating both loops.
+                raise _BoundaryLogsReducedRange(smaller_first, smaller_last) from e
+            raise
+
+    start = from_block
+    try:
+        while start <= to_block and first is None:
+            end = min(to_block, start + chunk_size - 1)
+            logs = await read_logs(start, end)
+            if logs:
+                logs.sort(
+                    key=lambda row: (
+                        int(str(row.get("blockNumber", "0x0")), 16),
+                        int(str(row.get("logIndex", "0x0")), 16),
+                    )
+                )
+                first = logs[0]
+            start = end + 1
+
+        end = to_block
+        while end >= from_block and last is None:
+            start = max(from_block, end - chunk_size + 1)
+            logs = await read_logs(start, end)
+            if logs:
+                logs.sort(
+                    key=lambda row: (
+                        int(str(row.get("blockNumber", "0x0")), 16),
+                        int(str(row.get("logIndex", "0x0")), 16),
+                    )
+                )
+                last = logs[-1]
+            end = start - 1
+    except _BoundaryLogsReducedRange as reduced:
+        return reduced.first, reduced.last, chunks_scanned
+
+    return first, last, chunks_scanned
 
 
 async def _eth_get_block_header(
@@ -265,6 +585,77 @@ async def _find_block_at_or_before_timestamp(
     return lo_block
 
 
+async def _check_historical_state_capability(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    *,
+    chain_id: int,
+    probe_contract: str,
+) -> HistoricalStateCapability:
+    """Detect whether `eth_call`-style historical state reads are trustworthy.
+
+    We use `eth_getCode(probe_contract, "0x1")` as a chain-agnostic pre-creation
+    probe: Pendle SY / underlying vault contracts should not exist at block 1.
+    A provider returning current bytecode at block 1 is silently serving latest
+    state for historical calls and must not be used for SY exchangeRate windows.
+    """
+    cache_key = (chain_id, rpc_url, probe_contract.lower())
+    now = time.time()
+    cached = _HISTORICAL_STATE_CAPABILITY_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, capability = cached
+        if now - cached_at < _RPC_CAPABILITY_CACHE_TTL_SECONDS:
+            return capability
+
+    try:
+        latest_code, block1_code = await asyncio.gather(
+            _eth_get_code(client, rpc_url, probe_contract, "latest"),
+            _eth_get_code(client, rpc_url, probe_contract, "0x1"),
+        )
+    except (httpx.HTTPError, _RpcError) as e:
+        capability = HistoricalStateCapability(
+            trusted=False,
+            status="untrusted_rpc",
+            error=f"{type(e).__name__}: {e}",
+            diagnostics={"probe_contract": probe_contract},
+        )
+    else:
+        if latest_code in {"0x", "0x0"}:
+            capability = HistoricalStateCapability(
+                trusted=False,
+                status="contract_revert",
+                error="probe contract has no latest bytecode",
+                diagnostics={"probe_contract": probe_contract},
+            )
+        elif block1_code not in {"0x", "0x0"}:
+            capability = HistoricalStateCapability(
+                trusted=False,
+                status="untrusted_rpc",
+                error=(
+                    "historical eth_getCode returned bytecode at block 1; "
+                    "provider is likely serving latest state for historical calls"
+                ),
+                diagnostics={
+                    "probe_contract": probe_contract,
+                    "latest_code_bytes": max(0, (len(latest_code) - 2) // 2),
+                    "block1_code_bytes": max(0, (len(block1_code) - 2) // 2),
+                },
+            )
+        else:
+            capability = HistoricalStateCapability(
+                trusted=True,
+                status="ok",
+                diagnostics={
+                    "probe_contract": probe_contract,
+                    "latest_code_bytes": max(0, (len(latest_code) - 2) // 2),
+                    "block1_code": block1_code,
+                },
+            )
+
+    _HISTORICAL_STATE_CAPABILITY_CACHE[cache_key] = (now, capability)
+    return capability
+
+
 async def _eth_call_exchange_rate(
     client: httpx.AsyncClient,
     rpc_url: str,
@@ -372,4 +763,313 @@ async def compute_u_actual_30d_chain(
         window_days=_THIRTY_DAYS,
         rpc_timeout_seconds=rpc_timeout_seconds,
         http_client=http_client,
+    )
+
+
+def _market_datetime(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+async def _try_read_nav_oracle(
+    client: httpx.AsyncClient,
+    rpc_url: str,
+    *,
+    vault_address: str,
+) -> str | None:
+    result: str | None = None
+    for attempt in range(3):
+        try:
+            result = await _eth_call_selector(
+                client, rpc_url, vault_address, _NAV_ORACLE_SELECTOR, "latest"
+            )
+            break
+        except (httpx.HTTPError, _RpcError):
+            if attempt == 2:
+                return None
+            await asyncio.sleep(0.2 * (attempt + 1))
+    if result is None:
+        return None
+    return _decode_address_word(result)
+
+
+def _decode_nav_reported(log: Mapping[str, Any]) -> tuple[int, int | None, int, int]:
+    data = log.get("data")
+    if not isinstance(data, str) or not data.startswith("0x"):
+        raise _RpcError("NavReported log missing hex data")
+    pps = _decode_uint256_word(data, 0)
+    reported_ts: int | None = None
+    try:
+        reported_ts = _decode_uint256_word(data, 1)
+    except _RpcError:
+        reported_ts = None
+    block_number_raw = log.get("blockNumber")
+    log_index_raw = log.get("logIndex")
+    if not isinstance(block_number_raw, str) or not block_number_raw.startswith("0x"):
+        raise _RpcError("NavReported log missing blockNumber")
+    if not isinstance(log_index_raw, str) or not log_index_raw.startswith("0x"):
+        raise _RpcError("NavReported log missing logIndex")
+    return pps, reported_ts, int(block_number_raw, 16), int(log_index_raw, 16)
+
+
+async def _compute_navoracle_event_chain_truth(
+    *,
+    chain_id: int,
+    market: Mapping[str, Any],
+    window_days: int,
+    rpc_timeout_seconds: float,
+) -> ChainTruthResult | None:
+    vault_address = parse_chain_address(market.get("underlyingAsset"))
+    if vault_address is None:
+        return None
+
+    rpc_urls = load_event_log_rpc_urls(chain_id)
+    if not rpc_urls:
+        return ChainTruthResult.fail(
+            status="adapter_required",
+            method="navoracle_event",
+            error=f"RPC_URL_{chain_id} not configured and no event-log fallback is known",
+            window_days=window_days,
+        )
+
+    last_error: str | None = None
+    for rpc_url in rpc_urls:
+        async with httpx.AsyncClient(timeout=rpc_timeout_seconds) as client:
+            nav_oracle = await _try_read_nav_oracle(
+                client, rpc_url, vault_address=vault_address
+            )
+            if nav_oracle is None:
+                continue
+            try:
+                latest_block, latest_ts = await _eth_get_block_header(
+                    client, rpc_url, "latest"
+                )
+                market_created_at = _market_datetime(market.get("timestamp"))
+                if market_created_at is not None:
+                    start_ts = int(market_created_at.timestamp()) - _SECONDS_PER_DAY
+                else:
+                    start_ts = latest_ts - window_days * _SECONDS_PER_DAY
+                target_ts = max(start_ts, latest_ts - window_days * _SECONDS_PER_DAY)
+                start_block = await _find_block_at_or_before_timestamp(
+                    client,
+                    rpc_url,
+                    target_ts=target_ts,
+                    latest_block=latest_block,
+                    latest_ts=latest_ts,
+                )
+                first_log, last_log, chunks_scanned = await _eth_get_boundary_logs_chunked(
+                    client,
+                    rpc_url,
+                    address=nav_oracle,
+                    topic0=_NAV_REPORTED_TOPIC,
+                    from_block=start_block,
+                    to_block=latest_block,
+                )
+            except (httpx.HTTPError, _RpcError) as e:
+                last_error = f"{type(e).__name__}: {e}"
+                continue
+
+        if first_log is None or last_log is None:
+            return ChainTruthResult.fail(
+                status="insufficient_history",
+                method="navoracle_event",
+                error="NavOracle emitted no NavReported events in the scan window",
+                window_days=window_days,
+                diagnostics={"nav_oracle": nav_oracle, "chunks_scanned": chunks_scanned},
+            )
+
+        first_pps, first_reported_ts, first_block, first_log_index = _decode_nav_reported(
+            first_log
+        )
+        last_pps, last_reported_ts, last_block, last_log_index = _decode_nav_reported(
+            last_log
+        )
+        if first_block == last_block and first_log_index == last_log_index:
+            return ChainTruthResult.fail(
+                status="insufficient_history",
+                method="navoracle_event",
+                error="NavOracle emitted fewer than 2 NavReported events in the scan window",
+                window_days=window_days,
+                diagnostics={"nav_oracle": nav_oracle, "chunks_scanned": chunks_scanned},
+            )
+        if first_pps <= 0:
+            return ChainTruthResult.fail(
+                status="contract_revert",
+                method="navoracle_event",
+                error="first NavReported pps is zero",
+                window_days=window_days,
+                diagnostics={"nav_oracle": nav_oracle, "first_block": first_block},
+            )
+
+        if first_reported_ts is not None and last_reported_ts is not None:
+            elapsed_seconds = last_reported_ts - first_reported_ts
+        else:
+            async with httpx.AsyncClient(timeout=rpc_timeout_seconds) as client:
+                first_ts, last_ts = await asyncio.gather(
+                    _eth_get_block_timestamp(client, rpc_url, first_block),
+                    _eth_get_block_timestamp(client, rpc_url, last_block),
+                )
+            elapsed_seconds = last_ts - first_ts
+
+        if elapsed_seconds <= 0:
+            return ChainTruthResult.fail(
+                status="insufficient_history",
+                method="navoracle_event",
+                error="NavReported event timestamps did not advance",
+                window_days=window_days,
+                diagnostics={"nav_oracle": nav_oracle},
+            )
+
+        effective_window_days = elapsed_seconds / _SECONDS_PER_DAY
+        ratio = last_pps / first_pps
+        apy = ratio ** (365.0 / effective_window_days) - 1.0
+        confidence = "high" if effective_window_days >= 1.0 else "medium"
+        return ChainTruthResult.ok(
+            value=apy,
+            method="navoracle_event",
+            confidence=confidence,
+            window_days=window_days,
+            effective_window_days=effective_window_days,
+            notes=(
+                "Computed from NavOracle.NavReported event-log pps ratio; "
+                "does not depend on historical eth_call."
+            ),
+            diagnostics={
+                "vault": vault_address,
+                "nav_oracle": nav_oracle,
+                "first_pps": first_pps,
+                "last_pps": last_pps,
+                "first_block": first_block,
+                "last_block": last_block,
+                "first_log_index": first_log_index,
+                "last_log_index": last_log_index,
+                "chunks_scanned": chunks_scanned,
+                "rpc_url_role": "primary"
+                if rpc_url == (load_rpc_url(chain_id) or "")
+                else "event_fallback",
+            },
+        )
+
+    if last_error is not None:
+        return ChainTruthResult.fail(
+            status="contract_revert",
+            method="navoracle_event",
+            error=last_error,
+            window_days=window_days,
+        )
+    return None
+
+
+async def _compute_sy_exchange_rate_chain_truth(
+    *,
+    chain_id: int,
+    sy_address: str,
+    window_days: int,
+    rpc_timeout_seconds: float,
+) -> ChainTruthResult:
+    rpc_url = load_rpc_url(chain_id)
+    if rpc_url is None:
+        return ChainTruthResult.fail(
+            status="untrusted_rpc",
+            method="sy_accumulator",
+            error=f"RPC_URL_{chain_id} not configured, cannot calibrate",
+            window_days=window_days,
+        )
+
+    async with httpx.AsyncClient(timeout=rpc_timeout_seconds) as client:
+        capability = await _check_historical_state_capability(
+            client,
+            rpc_url,
+            chain_id=chain_id,
+            probe_contract=sy_address,
+        )
+    if not capability.trusted:
+        return ChainTruthResult.fail(
+            status=capability.status,
+            method="sy_accumulator",
+            error=capability.error or "historical state calls are not trusted",
+            window_days=window_days,
+            diagnostics=capability.diagnostics,
+        )
+
+    value, error = await compute_u_actual_chain(
+        chain_id=chain_id,
+        sy_address=sy_address,
+        window_days=window_days,
+        rpc_timeout_seconds=rpc_timeout_seconds,
+    )
+    if error is not None or value is None:
+        status = "contract_revert"
+        if error and ("too young" in error or "not have been deployed" in error):
+            status = "insufficient_history"
+        return ChainTruthResult.fail(
+            status=status,
+            method="sy_accumulator",
+            error=error or "unknown SY exchangeRate calibration error",
+            window_days=window_days,
+            diagnostics=capability.diagnostics,
+        )
+    return ChainTruthResult.ok(
+        value=value,
+        method="sy_accumulator",
+        confidence="high",
+        window_days=window_days,
+        diagnostics=capability.diagnostics,
+    )
+
+
+async def compute_chain_truth_for_market(
+    *,
+    chain_id: int,
+    market: Mapping[str, Any],
+    window_days: int = _THIRTY_DAYS,
+    rpc_timeout_seconds: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
+) -> ChainTruthResult:
+    """Compute market-level chain truth with protocol-aware adapters.
+
+    Adapter order is deliberate: protocol-specific event adapters run before
+    the generic SY accumulator, so markets like AVLT do not get flattened into
+    a false "0%" result when SY.exchangeRate is not the actual yield path.
+    """
+    if window_days <= 0:
+        return ChainTruthResult.fail(
+            status="contract_revert",
+            method="none",
+            error=f"window_days must be positive, got {window_days}",
+            window_days=window_days,
+        )
+
+    nav_result = await _compute_navoracle_event_chain_truth(
+        chain_id=chain_id,
+        market=market,
+        window_days=window_days,
+        rpc_timeout_seconds=rpc_timeout_seconds,
+    )
+    if nav_result is not None:
+        return nav_result
+
+    sy_address = parse_sy_address(market.get("sy"))
+    if sy_address is None:
+        return ChainTruthResult.fail(
+            status="adapter_required",
+            method="none",
+            error=f"market sy field unparseable: {market.get('sy')!r}",
+            window_days=window_days,
+        )
+
+    return await _compute_sy_exchange_rate_chain_truth(
+        chain_id=chain_id,
+        sy_address=sy_address,
+        window_days=window_days,
+        rpc_timeout_seconds=rpc_timeout_seconds,
     )

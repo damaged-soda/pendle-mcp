@@ -30,7 +30,7 @@ from typing import Any, Mapping
 
 from pendle_mcp.chain_apy import (
     compute_u_actual_30d_chain,
-    compute_u_actual_chain,
+    compute_chain_truth_for_market,
     parse_sy_address,
 )
 from pendle_mcp.pendle_api import (
@@ -434,18 +434,48 @@ async def _build_new_market_opportunity_row(
 
     if sy_address is None:
         row["u_chain_long"] = None
-        row["chain_truth_error"] = f"market sy field unparseable: {market.get('sy')!r}"
+        row["chain_truth"] = {
+            "value": None,
+            "status": "adapter_required",
+            "method": "none",
+            "confidence": "none",
+            "error": f"market sy field unparseable: {market.get('sy')!r}",
+        }
+        row["chain_truth_status"] = "adapter_required"
+        row["chain_truth_method"] = "none"
+        row["chain_truth_confidence"] = "none"
+        row["chain_truth_error"] = row["chain_truth"]["error"]
         row["is_opportunity"] = False
         return row
 
-    value, error = await compute_u_actual_chain(
+    chain_truth = await compute_chain_truth_for_market(
         chain_id=chain_id,
-        sy_address=sy_address,
+        market=market,
         window_days=chain_truth_window_days,
     )
-    row["u_chain_long"] = value
-    if error is not None:
-        row["chain_truth_error"] = error
+    row["chain_truth"] = chain_truth.to_dict()
+    row["u_chain_long"] = chain_truth.value
+    row["chain_truth_status"] = chain_truth.status
+    row["chain_truth_method"] = chain_truth.method
+    row["chain_truth_confidence"] = chain_truth.confidence
+    if chain_truth.status != "ok":
+        row["chain_truth_error"] = chain_truth.error or chain_truth.status
+        row["is_opportunity"] = False
+        return row
+
+    value = chain_truth.value
+    if value is None:
+        row["chain_truth_error"] = "chain truth returned ok status without a value"
+        row["is_opportunity"] = False
+        return row
+    if value == 0 and u_ui is not None and u_ui > 0.001:
+        row["chain_truth"]["status"] = "adapter_required"
+        row["chain_truth"]["error"] = (
+            "SY accumulator is flat while Pendle UI APY is positive; "
+            "protocol-specific adapter required"
+        )
+        row["chain_truth_status"] = "adapter_required"
+        row["chain_truth_error"] = row["chain_truth"]["error"]
         row["is_opportunity"] = False
         return row
 
@@ -532,6 +562,9 @@ async def _detect_new_market_opportunities(
         ),
         reverse=True,
     )
+    unknown_candidates = [
+        row for row in rows if row.get("chain_truth_status") not in {None, "ok"}
+    ]
     non_opportunities = [row for row in rows if not row.get("is_opportunity")]
 
     result: dict[str, Any] = {
@@ -549,9 +582,11 @@ async def _detect_new_market_opportunities(
             "prefilter_candidates": len(candidates),
             "opportunities": len(opportunities),
             "chain_truth_errors": sum(1 for row in rows if row.get("chain_truth_error")),
+            "unknown_candidates": len(unknown_candidates),
             "prefilter_skipped": len(prefilter_skipped),
         },
         "opportunities": opportunities,
+        "unknown_candidates": unknown_candidates,
     }
     if include_non_opportunities:
         result["non_opportunities"] = non_opportunities
@@ -574,8 +609,8 @@ async def pendle_detect_new_market_opportunities(
     """Detect new Pendle markets where longer-window chain truth is not priced in.
 
     This is a manual scanner, not a cron/alarm tool. It fetches active markets,
-    filters to young + liquid markets, reads each candidate SY.exchangeRate()
-    over a configurable long window (default 90d), then flags markets where:
+    filters to young + liquid markets, computes each candidate's chain-truth
+    APY via a protocol-aware adapter registry (default 90d), then flags markets where:
 
     - `u_chain_long - u_ui_pendle >= spread_threshold_bps`, or
     - `u_chain_long - implied_apy >= implied_discount_threshold_bps`.
@@ -584,13 +619,20 @@ async def pendle_detect_new_market_opportunities(
     remain actionable even after Pendle's UI APY catches up: the trade only
     exists if the market's implied APY is still below the protocol forward rate.
 
-    Requirements:
-    - archive RPC at `RPC_URL_<chainId>` for historical SY.exchangeRate calls.
-    - `chain_truth_window_days` must not exceed the SY's historical readable
-      lifetime; otherwise the row returns `chain_truth_error` and is not flagged.
+    Chain-truth adapters currently include:
+    - `sy_accumulator`: historical `SY.exchangeRate()` reads, only after a
+      historical-state RPC probe passes.
+    - `navoracle_event`: `NavReported` event-log pps ratio for Avalon/NavVault
+      markets; this can work on chains where historical eth_call is unavailable
+      but event logs are trustworthy.
 
-    Returns `{parameters, snapshot_at, summary, opportunities}`. Pass
-    `include_non_opportunities=true` for calibration/debug output.
+    Rows that cannot be judged are surfaced in `unknown_candidates` with
+    `chain_truth.status` (`untrusted_rpc`, `adapter_required`,
+    `insufficient_history`, `contract_revert`) instead of being silently
+    interpreted as 0% yield.
+
+    Returns `{parameters, snapshot_at, summary, opportunities, unknown_candidates}`.
+    Pass `include_non_opportunities=true` for calibration/debug output.
     """
     return await _detect_new_market_opportunities(
         chain_id=chain_id,
