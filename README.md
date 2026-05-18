@@ -81,7 +81,7 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
 - **`pendle_detect_new_market_opportunities`**：手动扫描新 market 机会，不打飞书、不写 state。默认只看 `chain_id=1` / `market_age_days=30` / `min_tvl_usd=500000` 的 active market，读取每个候选 SY 的 `exchangeRate()` 做 `chain_truth_window_days=90` 长窗口链上 APY。触发条件有两条：
   - `u_chain_long - u_ui_pendle >= spread_threshold_bps`（默认 200 bps）：找出 Pendle UI sliding-window 明显低估 chain truth 的新 market。
   - `u_chain_long - implied_apy >= implied_discount_threshold_bps`（默认 50 bps）：找出 market implied APY 还没 price in 的候选。savUSD 当前更接近这一类 —— UI APY 会随时间追上，但只要 implied APY 仍低于 forward rate，H 交易仍可能有 spread。
-  - 返回 `{parameters, snapshot_at, summary, opportunities}`；调参 / 校准时可传 `include_non_opportunities=true` 看未触发行和 prefilter skip 原因。依赖同一个 `RPC_URL_<chainid>` archive RPC；如果 90d 前 SY 不可读，会在该行返回 `chain_truth_error`。
+  - 返回 `{parameters, snapshot_at, summary, opportunities}`；调参 / 校准时可传 `include_non_opportunities=true` 看未触发行和 prefilter skip 原因，也可调 `calibration_concurrency` 控制 archive RPC 并发。依赖同一个 `RPC_URL_<chainid>` archive RPC；如果 90d 前 SY 不可读，会在该行返回 `chain_truth_error`。
 - **`pendle_get_prices_ohlcv_v4.parse_results`**：默认 `false`；开启后把响应里 `results` 的 CSV 串解析成 `results_parsed`（结构化数组、字符串字段保精度），解析失败会带 `parse_error`。
 - **`pendle_get_merkle_rewards`**：响应同时包含 `claimableRewards`（待领取）与 `claimedRewards`（已领取），取代旧的 `pendle_get_merkle_claimed_rewards`。
 - **`pendle_get_user_pnl_transactions`**：纯翻页器，原样透传 API 的 `{total, results}`，`skip` / `limit` 直接翻页。要"对一个地址做整体评估"用下面的 `pendle_get_user_pnl_summary`，不要在这个 tool 上手工累加 page。

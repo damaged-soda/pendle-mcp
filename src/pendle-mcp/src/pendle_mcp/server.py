@@ -369,7 +369,9 @@ def _prefilter_new_market_opportunity_candidates(
             reason = "missing_or_bad_created_at"
         elif age_days > market_age_days:
             reason = "market_too_old"
-        elif tvl_usd is None or tvl_usd < min_tvl_usd:
+        elif tvl_usd is None:
+            reason = "missing_tvl"
+        elif tvl_usd < min_tvl_usd:
             reason = "tvl_below_threshold"
         elif sy_address is None:
             reason = "missing_or_bad_sy"
