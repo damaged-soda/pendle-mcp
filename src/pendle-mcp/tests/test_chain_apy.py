@@ -15,6 +15,7 @@ from pendle_mcp.chain_apy import (
     compute_u_actual_chain,
     compute_u_actual_30d_chain,
     load_rpc_url,
+    load_rpc_urls,
     parse_sy_address,
 )
 
@@ -53,6 +54,18 @@ def test_load_rpc_url_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_load_rpc_url_strips_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RPC_URL_1", "   https://example.com/eth   ")
     assert load_rpc_url(1) == "https://example.com/eth"
+
+
+def test_load_rpc_urls_supports_comma_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "RPC_URL_1",
+        " https://primary.example.com , https://fallback.example.com, https://primary.example.com ",
+    )
+    assert load_rpc_urls(1) == [
+        "https://primary.example.com",
+        "https://fallback.example.com",
+    ]
+    assert load_rpc_url(1) == "https://primary.example.com"
 
 
 def test_load_rpc_url_empty_string_treated_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,7 +333,105 @@ async def test_compute_chain_truth_rejects_untrusted_historical_state(
     assert result.status == "untrusted_rpc"
     assert result.method == "sy_accumulator"
     assert result.value is None
-    assert "block 1" in (result.error or "")
+    assert result.diagnostics["rpc_attempts"][0]["status"] == "untrusted_rpc"
+    assert "block1_code_bytes" in result.diagnostics["rpc_attempts"][0]
+
+
+@pytest.mark.asyncio
+async def test_compute_chain_truth_skips_untrusted_rpc_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_rpc = "https://bad-rpc.example.com"
+    good_rpc = "https://good-rpc.example.com"
+    sy = "0x" + "ef" * 20
+    monkeypatch.setenv("RPC_URL_1", f"{bad_rpc},{good_rpc}")
+
+    latest_block = 1_000_000
+    block_time = 12.0
+    genesis_ts = 1_760_000_000
+    expected_past_block = latest_block - int(30 * 86400 / block_time)
+    rate_past = 10**18
+    rate_now = int(rate_past * (1.0 + 0.05 * 30.0 / 365.0))
+    urls_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        rpc_id = payload.get("id", 1)
+        method = payload.get("method")
+        url = str(request.url)
+        urls_seen.append(url)
+        if url == bad_rpc and method == "eth_getCode":
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": rpc_id, "result": "0x60016000"},
+            )
+        if url == good_rpc and method == "eth_getCode":
+            block_tag = payload["params"][1]
+            result = "0x" if block_tag == "0x1" else "0x60016000"
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": rpc_id, "result": result},
+            )
+        if url == good_rpc and method == "eth_getBlockByNumber":
+            block_tag = payload["params"][0]
+            n = latest_block if block_tag == "latest" else int(block_tag, 16)
+            ts = int(genesis_ts + n * block_time)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {"number": hex(n), "timestamp": hex(ts)},
+                },
+            )
+        if url == good_rpc and method == "eth_call":
+            block_number = int(payload["params"][1], 16)
+            rate = rate_now if block_number == latest_block else rate_past
+            if block_number not in {latest_block, expected_past_block}:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "error": {"code": -32000, "message": f"no rate at {block_number}"},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"jsonrpc": "2.0", "id": rpc_id, "result": _u256_hex(rate)},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "error": {"code": -32601, "message": "unhandled"},
+            },
+        )
+
+    market = {
+        "sy": f"1-{sy}",
+        "timestamp": "2026-05-11T00:00:00.000Z",
+    }
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "pendle_mcp.chain_apy.httpx.AsyncClient",
+        lambda **_: real_async_client(transport=transport),
+    )
+    result = await compute_chain_truth_for_market(
+        chain_id=1,
+        market=market,
+        window_days=30,
+    )
+
+    assert result.status == "ok"
+    assert result.method == "sy_accumulator"
+    assert result.value == pytest.approx(0.05, abs=1e-4)
+    assert result.diagnostics["rpc_url"] == good_rpc
+    assert any(attempt["rpc_url"] == bad_rpc for attempt in result.diagnostics["rpc_attempts"])
+    assert bad_rpc in urls_seen
+    assert good_rpc in urls_seen
 
 
 @pytest.mark.asyncio

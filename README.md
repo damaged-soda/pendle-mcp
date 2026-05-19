@@ -80,7 +80,7 @@ echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdi
 - **链上校准的 RPC 约束**：需要 archive RPC，跟 etherscan-mcp 一致从 `RPC_URL_<chainid>` 读。Etherscan `module=proxy` 的 eth_call 永远返回 latest（即使传历史 block tag），所以**不会** fallback 到它 —— 没配 RPC 就直接报 error。30d-ago block 走 `eth_getBlockByNumber` timestamp 搜索（Newton 估算 + cadence-guided bisect，不维护静态 chain block-time 表，Pendle 新加链不改代码就能用）；实测 ETH 6 RPC / ~1s、Arb 10 RPC / ~1.3s。chain 历史 < 30d 时返回 `u_actual_chain_error="chain too young: ..."`。
 - **`pendle_detect_new_market_opportunities`**：手动扫描新 market 机会，不打飞书、不写 state。默认只看 `chain_id=1` / `market_age_days=30` / `min_tvl_usd=500000` 的 active market，用 adapter registry 读取 `chain_truth_window_days=90` 长窗口链上 APY。当前 adapter：
   - `sy_accumulator`：读取 `SY.exchangeRate()` 历史差分，**只在 RPC historical state probe 可信时启用**；probe 用候选合约在 block 1 的 `eth_getCode` 必须返回 `0x`，防止 RPC silent 返回 latest state。
-  - `navoracle_event`：Avalon / AVLT 这类 `NavVault -> NavOracle` market 走 `NavReported(uint256,uint256)` event log 的 pps ratio，不依赖 historical `eth_call`。HyperEVM 上 dRPC 作为 `RPC_URL_999` primary，HL 官方 RPC 作为 event-log fallback。
+  - `navoracle_event`：Avalon / AVLT 这类 `NavVault -> NavOracle` market 走 `NavReported(uint256,uint256)` event log 的 pps ratio，不依赖 historical `eth_call`。如果 `RPC_URL_<chainid>` 配成逗号列表（例如 HyperEVM 上 `RPC_URL_999=https://hyperliquid.drpc.org,https://rpc.hyperliquid.xyz/evm`），adapter 会按顺序尝试各 URL。
   - 未识别或不可验证的 market 不再静默当 0：会进入 `unknown_candidates`，并带 `chain_truth.status`（`untrusted_rpc` / `adapter_required` / `insufficient_history` / `contract_revert`）。
   触发条件有两条：
   - `u_chain_long - u_ui_pendle >= spread_threshold_bps`（默认 200 bps）：找出 Pendle UI sliding-window 明显低估 chain truth 的新 market。
@@ -103,7 +103,7 @@ API 错误统一返回 `PendleApiError`，字段：`error_type / status_code / m
 | `PENDLE_API_RETRY_BACKOFF_SECONDS` | `0.2` | 指数退避基数 + jitter |
 | `PENDLE_API_MAX_CONCURRENCY` | `4` | 进程级出站并发上限。所有 `PendleApiClient` 共享一个 `asyncio.Semaphore`，槽位贯穿整个重试循环（包括 backoff sleep）—— 给 Pendle 真正的 cooldown 喘息，避免 inflight 互相 barge 重新触发 429。设大数字（如 `1000`）等于关闭。 |
 | `PENDLE_API_ERROR_DETAIL_MAX_CHARS` | `2048` | 错误 `detail` 字段截断上限 |
-| `RPC_URL_<chainid>` | （未设） | 链上 APY 校准用的 JSON-RPC 端点。`pendle_get_market_data_v2` 仍用它做 `SY.exchangeRate()` 30d 校准；`pendle_detect_new_market_opportunities` 会先做 historical state probe，可信才用 `sy_accumulator`，否则 fail closed 到 `unknown_candidates`。命名跟 etherscan-mcp 一致，所以同一份 env 两边都生效。 |
+| `RPC_URL_<chainid>` | （未设） | 链上 APY 校准用的 JSON-RPC 端点。支持单 URL 或逗号分隔 fallback 列表，例如 `RPC_URL_999=https://hyperliquid.drpc.org,https://rpc.hyperliquid.xyz/evm`；前者优先。`pendle_get_market_data_v2` 仍用第一个 URL 做 legacy `SY.exchangeRate()` 30d 校准；`pendle_detect_new_market_opportunities` 会逐个 URL 做 historical state probe，可信才用 `sy_accumulator`，event-log adapter 会按顺序尝试可读 logs 的 URL，否则 fail closed 到 `unknown_candidates`。命名跟 etherscan-mcp 一致，所以同一份 env 两边都生效。 |
 
 ## 命名约定
 

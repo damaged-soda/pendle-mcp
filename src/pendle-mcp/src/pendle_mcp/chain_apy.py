@@ -68,10 +68,6 @@ _DEFAULT_RPC_TIMEOUT_SECONDS = 15.0
 _RPC_CAPABILITY_CACHE_TTL_SECONDS = 86400
 _LOG_CHUNK_SIZE_BLOCKS = 10_000
 
-_EVENT_LOG_FALLBACK_RPCS: dict[int, tuple[str, ...]] = {
-    999: ("https://rpc.hyperliquid.xyz/evm",),
-}
-
 
 @dataclass(frozen=True)
 class ChainTruthResult:
@@ -189,30 +185,39 @@ def _rpc_url_env_name(chain_id: int) -> str:
     return f"RPC_URL_{chain_id}"
 
 
-def load_rpc_url(chain_id: int) -> str | None:
+def load_rpc_urls(chain_id: int) -> list[str]:
+    """Return RPC URLs from `RPC_URL_<chainid>`.
+
+    A single URL is the common case. Comma-separated values express
+    priority/fallback order for chains where different providers have
+    different capabilities, e.g. archive-state vs event-log support.
+    """
     raw = os.getenv(_rpc_url_env_name(chain_id))
     if raw is None:
+        return []
+    urls: list[str] = []
+    for item in raw.split(","):
+        stripped = item.strip()
+        if stripped and stripped not in urls:
+            urls.append(stripped)
+    return urls
+
+
+def load_rpc_url(chain_id: int) -> str | None:
+    urls = load_rpc_urls(chain_id)
+    if not urls:
         return None
-    stripped = raw.strip()
-    return stripped or None
+    return urls[0]
 
 
 def load_event_log_rpc_urls(chain_id: int) -> list[str]:
-    """Return primary RPC plus known event-log fallbacks for a chain.
+    """Return configured RPC URLs in priority order for event-log adapters.
 
-    The primary `RPC_URL_<chainid>` must be archive-state capable for
-    historical `eth_call`. Event-log adapters can safely fall back to
-    endpoints that support `eth_getLogs` even if historical state calls are
-    untrusted (e.g. HyperEVM official RPC).
+    `RPC_URL_<chainid>` supports comma-separated fallbacks. Unlike historical
+    state reads, event-log adapters may use endpoints that support
+    `eth_getLogs` even if historical `eth_call` is untrusted.
     """
-    urls: list[str] = []
-    primary = load_rpc_url(chain_id)
-    if primary is not None:
-        urls.append(primary)
-    for url in _EVENT_LOG_FALLBACK_RPCS.get(chain_id, ()):
-        if url not in urls:
-            urls.append(url)
-    return urls
+    return load_rpc_urls(chain_id)
 
 
 def parse_sy_address(sy_field: Any) -> str | None:
@@ -689,6 +694,7 @@ async def compute_u_actual_chain(
     chain_id: int,
     sy_address: str,
     window_days: int = _THIRTY_DAYS,
+    rpc_url: str | None = None,
     rpc_timeout_seconds: float = _DEFAULT_RPC_TIMEOUT_SECONDS,
     http_client: httpx.AsyncClient | None = None,
 ) -> tuple[float | None, str | None]:
@@ -706,8 +712,8 @@ async def compute_u_actual_chain(
     if window_days <= 0:
         return None, f"window_days must be positive, got {window_days}"
 
-    rpc_url = load_rpc_url(chain_id)
-    if rpc_url is None:
+    effective_rpc_url = rpc_url or load_rpc_url(chain_id)
+    if effective_rpc_url is None:
         return None, f"RPC_URL_{chain_id} not configured, cannot calibrate"
 
     owns_client = http_client is None
@@ -715,19 +721,23 @@ async def compute_u_actual_chain(
     try:
         try:
             latest_block, latest_ts = await _eth_get_block_header(
-                client, rpc_url, "latest"
+                client, effective_rpc_url, "latest"
             )
             target_ts = latest_ts - window_days * _SECONDS_PER_DAY
             past_block = await _find_block_at_or_before_timestamp(
                 client,
-                rpc_url,
+                effective_rpc_url,
                 target_ts=target_ts,
                 latest_block=latest_block,
                 latest_ts=latest_ts,
             )
             rate_now_raw, rate_past_raw = await asyncio.gather(
-                _eth_call_exchange_rate(client, rpc_url, sy_address, latest_block),
-                _eth_call_exchange_rate(client, rpc_url, sy_address, past_block),
+                _eth_call_exchange_rate(
+                    client, effective_rpc_url, sy_address, latest_block
+                ),
+                _eth_call_exchange_rate(
+                    client, effective_rpc_url, sy_address, past_block
+                ),
             )
         except (httpx.HTTPError, _RpcError) as e:
             return None, f"{type(e).__name__}: {e}"
@@ -977,8 +987,8 @@ async def _compute_sy_exchange_rate_chain_truth(
     window_days: int,
     rpc_timeout_seconds: float,
 ) -> ChainTruthResult:
-    rpc_url = load_rpc_url(chain_id)
-    if rpc_url is None:
+    rpc_urls = load_rpc_urls(chain_id)
+    if not rpc_urls:
         return ChainTruthResult.fail(
             status="untrusted_rpc",
             method="sy_accumulator",
@@ -986,26 +996,43 @@ async def _compute_sy_exchange_rate_chain_truth(
             window_days=window_days,
         )
 
+    failed_capabilities: list[dict[str, Any]] = []
+    selected_rpc_url: str | None = None
+    selected_capability: HistoricalStateCapability | None = None
     async with httpx.AsyncClient(timeout=rpc_timeout_seconds) as client:
-        capability = await _check_historical_state_capability(
-            client,
-            rpc_url,
-            chain_id=chain_id,
-            probe_contract=sy_address,
-        )
-    if not capability.trusted:
+        for rpc_url in rpc_urls:
+            capability = await _check_historical_state_capability(
+                client,
+                rpc_url,
+                chain_id=chain_id,
+                probe_contract=sy_address,
+            )
+            if capability.trusted:
+                selected_rpc_url = rpc_url
+                selected_capability = capability
+                break
+            failed_capabilities.append(
+                {
+                    "rpc_url": rpc_url,
+                    "status": capability.status,
+                    "error": capability.error,
+                    **capability.diagnostics,
+                }
+            )
+    if selected_rpc_url is None or selected_capability is None:
         return ChainTruthResult.fail(
-            status=capability.status,
+            status="untrusted_rpc",
             method="sy_accumulator",
-            error=capability.error or "historical state calls are not trusted",
+            error="no configured RPC URL passed historical-state capability probe",
             window_days=window_days,
-            diagnostics=capability.diagnostics,
+            diagnostics={"rpc_attempts": failed_capabilities},
         )
 
     value, error = await compute_u_actual_chain(
         chain_id=chain_id,
         sy_address=sy_address,
         window_days=window_days,
+        rpc_url=selected_rpc_url,
         rpc_timeout_seconds=rpc_timeout_seconds,
     )
     if error is not None or value is None:
@@ -1017,14 +1044,16 @@ async def _compute_sy_exchange_rate_chain_truth(
             method="sy_accumulator",
             error=error or "unknown SY exchangeRate calibration error",
             window_days=window_days,
-            diagnostics=capability.diagnostics,
+            diagnostics=selected_capability.diagnostics
+            | {"rpc_url": selected_rpc_url, "rpc_attempts": failed_capabilities},
         )
     return ChainTruthResult.ok(
         value=value,
         method="sy_accumulator",
         confidence="high",
         window_days=window_days,
-        diagnostics=capability.diagnostics,
+        diagnostics=selected_capability.diagnostics
+        | {"rpc_url": selected_rpc_url, "rpc_attempts": failed_capabilities},
     )
 
 
