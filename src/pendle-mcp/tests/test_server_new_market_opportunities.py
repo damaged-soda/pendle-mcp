@@ -6,6 +6,7 @@ from typing import Any, Mapping
 import pytest
 
 from pendle_mcp import server
+from pendle_mcp.chain_apy import ChainTruthResult
 
 _REAL_DATETIME = _real_dt.datetime
 
@@ -101,15 +102,20 @@ async def test_detect_new_market_opportunities_flags_implied_discount(
             return _FakeClient(markets)
 
     async def fake_compute(
-        *, chain_id: int, sy_address: str, window_days: int
-    ) -> tuple[float | None, str | None]:
+        *, chain_id: int, market: Mapping[str, Any], window_days: int
+    ) -> ChainTruthResult:
         assert chain_id == 1
-        assert sy_address == "0x0caefeb807152fbd945bf947893e6feba5aed61b"
+        assert market["sy"] == "1-0x0caefeb807152fbd945bf947893e6feba5aed61b"
         assert window_days == 90
-        return 0.074, None
+        return ChainTruthResult.ok(
+            value=0.074,
+            method="sy_accumulator",
+            confidence="high",
+            window_days=window_days,
+        )
 
     monkeypatch.setattr(server, "PendleApiClient", FakeClientFactory)
-    monkeypatch.setattr(server, "compute_u_actual_chain", fake_compute)
+    monkeypatch.setattr(server, "compute_chain_truth_for_market", fake_compute)
     monkeypatch.setattr(
         server.dt,
         "datetime",
@@ -134,6 +140,8 @@ async def test_detect_new_market_opportunities_flags_implied_discount(
     assert opportunity["market_name"] == "savUSD"
     assert opportunity["ui_spread_bps"] == pytest.approx(-40.0)
     assert opportunity["implied_discount_bps"] == pytest.approx(80.0)
+    assert opportunity["chain_truth_status"] == "ok"
+    assert opportunity["chain_truth_method"] == "sy_accumulator"
     assert opportunity["trigger_reasons"] == ["market_implied_below_chain_truth"]
     assert result["prefilter_skipped"][0]["reason"] == "market_too_old"
 
@@ -159,11 +167,16 @@ async def test_detect_new_market_opportunities_surfaces_chain_truth_error(
         def from_env() -> _FakeClient:
             return _FakeClient(markets)
 
-    async def fake_compute(**_: Any) -> tuple[float | None, str | None]:
-        return None, "eth_call returned empty data"
+    async def fake_compute(**kwargs: Any) -> ChainTruthResult:
+        return ChainTruthResult.fail(
+            status="contract_revert",
+            method="sy_accumulator",
+            error="eth_call returned empty data",
+            window_days=kwargs.get("window_days"),
+        )
 
     monkeypatch.setattr(server, "PendleApiClient", FakeClientFactory)
-    monkeypatch.setattr(server, "compute_u_actual_chain", fake_compute)
+    monkeypatch.setattr(server, "compute_chain_truth_for_market", fake_compute)
     monkeypatch.setattr(server.dt, "datetime", _FixedDateTime)
 
     result = await server._detect_new_market_opportunities(
@@ -179,6 +192,8 @@ async def test_detect_new_market_opportunities_surfaces_chain_truth_error(
 
     assert result["summary"]["opportunities"] == 0
     assert result["summary"]["chain_truth_errors"] == 1
+    assert result["summary"]["unknown_candidates"] == 1
+    assert result["unknown_candidates"][0]["chain_truth_status"] == "contract_revert"
     assert result["non_opportunities"][0]["chain_truth_error"] == "eth_call returned empty data"
 
 
