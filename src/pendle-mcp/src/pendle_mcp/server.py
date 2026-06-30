@@ -21,6 +21,7 @@ bisect on `RPC_URL_<chainid>`) — see `pendle_mcp.chain_apy`.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import csv
 import datetime as dt
@@ -1451,4 +1452,32 @@ async def pendle_health(
 
 
 def run() -> None:
-    mcp.run()
+    parser = argparse.ArgumentParser(description="Run the Pendle MCP server.")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="Transport protocol for MCP.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for SSE/HTTP transports.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8701,
+        help="Port for SSE/HTTP transports.",
+    )
+    parser.add_argument(
+        "--streamable-http-path",
+        default="/mcp",
+        help="HTTP path for streamable HTTP transport.",
+    )
+    args = parser.parse_args()
+
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.streamable_http_path = args.streamable_http_path
+    mcp.run(transport=args.transport)
