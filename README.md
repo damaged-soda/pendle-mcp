@@ -12,6 +12,7 @@ cd src/pendle-mcp
 pip install -e ".[dev]"
 pytest
 python -m pendle_mcp   # stdio 运行
+python -m pendle_mcp --transport streamable-http --host 127.0.0.1 --port 8701 --streamable-http-path /mcp
 ```
 
 代码入口：`src/pendle-mcp/src/pendle_mcp/`。
