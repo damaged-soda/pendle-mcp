@@ -1,6 +1,6 @@
 # pendle-mcp
 
-`pendle-mcp` 是一个 stdio MCP server，把 Pendle 官方 API v2（`https://api-v2.pendle.finance/core`）封成只读查询 tools，供 Claude Code / Codex 等 MCP 客户端调用。
+CLI + stdio MCP server，把 Pendle 官方 API v2（`https://api-v2.pendle.finance/core`）封成只读查询能力：市场 / 资产 / 价格 / OHLCV / 持仓 / PnL / limit order / vePENDLE / sPENDLE / swap 报价（convert）/ 新市场机会扫描。
 
 只暴露语义只读的 GET 端点，不签名、不广播链上交易；可能触发动作的 GET（cancel/redeem/swap、`/v1/spendle/{address}` 等）也不接入。
 
@@ -11,36 +11,92 @@ conda activate pendle-mcp
 cd src/pendle-mcp
 pip install -e ".[dev]"
 pytest
-python -m pendle_mcp   # stdio 运行
-python -m pendle_mcp --transport streamable-http --host 127.0.0.1 --port 8701 --streamable-http-path /mcp
+python -m pendle_mcp.cli --help   # CLI（主要接口）
 ```
 
 代码入口：`src/pendle-mcp/src/pendle_mcp/`。
 
-## 命令行（live 测试）
+## CLI
 
-`pendle-mcp-cli` 直接调 tool 函数走真实 Pendle API，不经 MCP 客户端 —— 用来在改 server 代码后**不重启 Claude Code** 就能验证。
+CLI 是主要接口（TOOLING 决策 2026-07-05：能力经 CLI + skill 暴露），子命令与 MCP tools 一一对应、直调 tool 函数内核（参数校验 / API client / 响应后处理），绕开 MCP 协议层。
+
+**映射规则**：MCP tool `pendle_<name>` → 子命令 `<name>`（去掉 `pendle_` 前缀，下划线换连字符），如 `pendle_get_market_data_v2` → `get-market-data-v2`；tool 的 `snake_case` 参数 → `--kebab-case` flag；数组参数（`--ids` / `--fields` / `--tokens-in` / `--amounts-in` / `--tokens-out` / `--aggregators`）一律 JSON 数组字符串；默认 `None` 的布尔参数是 `--xxx` / `--no-xxx` 三态 flag，不传就不发该参数。
 
 ```bash
-pendle-mcp-cli list                          # 列出所有 tool
-pendle-mcp-cli show pendle_convert_v2        # 看签名 + docstring
-pendle-mcp-cli call pendle_health --json '{}'
-pendle-mcp-cli call pendle_convert_v2 --json '{
-  "chain_id": 1,
-  "slippage": 0.005,
-  "tokens_in":  ["0xcbc72d92b2dc8187414f6734718563898740c0bc"],
-  "amounts_in": ["1000000000000000000"],
-  "tokens_out": ["0xb253eff1104802b97ac7e3ac9fdd73aece295a2c"],
-  "enable_aggregator": true
-}'
-echo '{...}' | pendle-mcp-cli call pendle_convert_v2 --json -   # 也可从 stdin 读
+pendle <subcommand> [options]   # 本机 wrapper；仓内等价 python -m pendle_mcp.cli
+pendle --help                   # 环境变量与子命令全表
+
+# Chains / Health
+pendle get-chains
+pendle health [--chain-id N --market-address 0x.. --asset-address 0x..]
+
+# Markets
+pendle get-markets-all [--chain-id N] [--ids '["1-0x..."]'] [--is-active|--no-is-active] [--order-by 'totalTvl:-1'] [--skip N --limit M]
+pendle get-markets-points-market [--chain-id N] [--is-active|--no-is-active]
+pendle get-market-data-v2 --chain-id N --address 0x.. [--timestamp ISO]        # 响应始终附 u_actual_30d_chain 链上校准
+pendle get-market-historical-data-v3 --chain-id N --address 0x.. [--time-frame hour|day|week|1h|1d|1w] [--timestamp-start ISO --timestamp-end ISO] [--fields '["impliedApy"]'] [--include-fee-breakdown] [--include-apy-breakdown]
+pendle detect-new-market-opportunities [--chain-id 1] [--market-age-days 30] [--chain-truth-window-days 90] [--spread-threshold-bps 200] [--implied-discount-threshold-bps 50] [--min-tvl-usd 500000] [--include-non-opportunities] [--calibration-concurrency 2]
+
+# Assets / Prices
+pendle get-assets-all [--ids '["1-0x..."]'] [--chain-id N] [--skip N --limit M] [--asset-type PENDLE_LP|SY|PT|YT]
+pendle get-asset-prices [--ids '["1-0x..."]'] [--chain-id N] [--skip N --limit M] [--asset-type PT|...]
+pendle get-prices-ohlcv-v4 --chain-id N --address 0x.. [--time-frame 1d] [--timestamp-start ISO --timestamp-end ISO] [--parse-results]
+
+# Transactions / PnL
+pendle get-user-pnl-transactions --user 0x.. [--skip N --limit M] [--chain-id N] [--market 0x..]
+pendle get-user-pnl-summary --user 0x.. [--chain-id N] [--market 0x..] [--group-by action|tx_hash] [--page-size N]
+pendle get-market-transactions-v5 --chain-id N --address 0x.. [--transaction-type TRADES|LIQUIDITY] [--action LONG_YIELD|SHORT_YIELD|ADD_LIQUIDITY|REMOVE_LIQUIDITY] [--min-value X --tx-origin 0x.. --resume-token T --skip N --limit M]
+pendle get-user-pnl-gained-positions --user 0x..
+
+# Dashboard
+pendle get-user-positions --user 0x.. [--filter-usd X]
+pendle get-merkle-rewards --user 0x..
+
+# Limit Orders
+pendle get-limit-orders-all-v2 [--chain-id N --limit M --maker 0x.. --yt 0x.. --timestamp-start ISO --timestamp-end ISO --resume-token T]
+pendle get-limit-orders-archived-v2 [同上]
+pendle get-limit-orders-book-v2 --chain-id N --precision-decimal D --market 0x.. [--limit M] [--include-amm|--no-include-amm]
+pendle get-limit-orders-maker-limit-orders --chain-id N --maker 0x.. [--skip N --limit M --yt 0x.. --order-type T] [--is-active|--no-is-active]
+pendle get-limit-orders-taker-limit-orders --chain-id N --yt 0x.. --order-type T [--skip N --limit M --sort-by K --sort-order asc|desc]
+
+# SDK（查询 / 报价）
+pendle get-supported-aggregators --chain-id N
+pendle get-market-tokens --chain-id N --market 0x..
+pendle get-swapping-prices --chain-id N --market 0x..
+pendle get-pt-cross-chain-metadata --chain-id N --pt 0x..
+pendle convert-v2 --chain-id N --slippage 0.005 --tokens-in '["0x.."]' --amounts-in '["1000000000000000000"]' --tokens-out '["0x.."]' [--receiver 0x..] [--enable-aggregator] [--aggregators '["kyberswap"]'] [--redeem-rewards] [--need-scale] [--additional-data impliedApy] [--use-limit-order] [--include-tx]
+
+# Ve / sPENDLE / Statistics
+pendle get-ve-pendle-data-v2
+pendle get-ve-pendle-market-fees-chart [--timestamp-start ISO --timestamp-end ISO]
+pendle get-spendle-data
+pendle get-distinct-user-from-token --token 0x.. [--chain-id N]
 ```
 
-成功输出 stdout 是格式化 JSON；`PendleApiError` 走 stdout 之外，结构化打到 stderr 并以非零退出码返回。覆盖范围：tool 函数 + 参数校验 + API 客户端 + 响应后处理 —— 唯一**没**测的是 FastMCP 的传输层（参数解析 / 响应序列化），那一层有传输回归时再用 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) 验。
+保留三个泛用内省子命令（改 server 代码后不重启 MCP host 也能验证）：
+
+```bash
+pendle list                            # 列出所有 tool 函数名
+pendle show pendle_convert_v2          # 看签名 + docstring
+pendle call pendle_health --json '{}'  # 按 tool 名直接传 JSON kwargs（也可 --json - 走 stdin）
+```
+
+成功输出 stdout 是格式化 JSON；`PendleApiError` 结构化打到 stderr 并以退出码 1 返回（参数 / JSON 错误退出码 2）。覆盖范围：tool 函数 + 参数校验 + API 客户端 + 响应后处理 —— 唯一**没**测的是 FastMCP 的传输层（参数解析 / 响应序列化），那一层有传输回归时再用 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) 验。
+
+## MCP（能力保留，本机注册已退役）
+
+> 2026-07-07 起本机不再注册本仓 MCP（TOOLING 决策：存量 MCP 逐仓退役，能力走 CLI + skill）。server 代码保留，其他环境如需注册可参考下例。
+
+```bash
+cd src/pendle-mcp
+python -m pendle_mcp   # stdio 运行
+python -m pendle_mcp --transport streamable-http --host 127.0.0.1 --port 8701 --streamable-http-path /mcp
+```
 
 ## 模块结构
 
 - `pendle_mcp.server` —— FastMCP server（stdio）与 tools 定义
+- `pendle_mcp.cli` —— `pendle` CLI（每个 tool 一个原生子命令 + 泛用 `list`/`show`/`call`）
 - `pendle_mcp.pendle_api` —— `PendleApiClient`（baseUrl / timeout / 重试 / 错误归一化）与 endpoint 封装
 - `tests/test_pendle_api_client.py` —— mock HTTP 单测，不依赖真实网络
 

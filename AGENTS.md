@@ -4,7 +4,7 @@
 
 ## 本仓职责
 
-Stdio MCP server，把 Pendle 官方 API v2 封成只读查询 tools 给 MCP 客户端用。当前已注册为本机 Claude Code + Codex 的 MCP server。
+CLI + stdio MCP server，把 Pendle 官方 API v2 封成只读查询能力（市场 / 资产 / 价格 / OHLCV / 持仓 / PnL / limit order / vePENDLE 等）。本机以 `pendle` CLI 暴露（wrapper 在 `~/ns/personal/bin/pendle`，凭据从 0600 secret.env 注入；skill 正本在 `~/ns/personal/skills/pendle/`）；MCP 注册已于 2026-07-07 退役（决策见 `~/work/charter/TOOLING.md`），server 代码保留。
 
 代码、模块结构、tool 清单、参数约定、环境变量见 [README.md](README.md)。
 
