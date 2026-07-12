@@ -204,6 +204,30 @@ def test_call_argument_error_returns_exit_2(
     assert "argument error" in err
 
 
+def test_call_generic_error_is_redacted_and_returns_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def raise_with_endpoint(**_kwargs):
+        raise ValueError(
+            "failed https://api-user:api-password@rpc.example:8545/v2/key"
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "_discover_tools",
+        lambda: {"pendle_test_error": raise_with_endpoint},
+    )
+
+    rc = cli.main(["call", "pendle_test_error", "--json", "{}"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err == "Error: failed https://rpc.example:8545/***\n"
+    assert "api-user" not in err
+    assert "api-password" not in err
+
+
 # ---------------------------------------------------------------------------
 # native subcommand surface (one subcommand per MCP tool)
 # ---------------------------------------------------------------------------

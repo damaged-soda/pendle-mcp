@@ -23,11 +23,11 @@ from typing import Any, Callable
 
 # RPC_URL_<chainid>(链上 APY 校准用)常内嵌 api-key。兜底错误信息里的 URL 截到
 # scheme://host、其余换 /***,避免 key 进 stderr / 日志 / transcript。
-_URL_RE = re.compile(r"(https?://[^/\s?#]+)[^\s]*")
+_URL_RE = re.compile(r"(https?://)(?:[^@/\s?#]+@)?([^/\s?#]+)[^\s]*")
 
 
 def _redact_secrets(text: str) -> str:
-    return _URL_RE.sub(r"\1/***", text)
+    return _URL_RE.sub(r"\1\2/***", text)
 
 from pendle_mcp import server
 from pendle_mcp.pendle_api import (
@@ -234,6 +234,9 @@ def cmd_call(args: argparse.Namespace) -> int:
     except TypeError as e:
         print(f"argument error: {e}", file=sys.stderr)
         return 2
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"Error: {_redact_secrets(str(e))}", file=sys.stderr)
+        return 1
     print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
     return 0
 
