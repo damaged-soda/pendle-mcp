@@ -1,6 +1,7 @@
 # 子仓面包屑
 
-这个仓属于个人 fleet。**完整上下文先读 `/Users/leavan/work/personal/fleet/AGENTS.md` 与 `/Users/leavan/work/personal/fleet/STATE.md`**；本文件只放 pendle-mcp 的局部约定。（同目录下也有等价的 `CLAUDE.md`。）
+这个仓属于 personal 域（域约定见 `~/work/personal/AGENTS.md`）；本文件只放
+pendle-mcp 的局部约定。
 
 ## 本仓职责
 
