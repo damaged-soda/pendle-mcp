@@ -1,6 +1,6 @@
 # 子仓面包屑
 
-这个仓属于 personal 域（域约定见 `~/work/personal/AGENTS.md`）；本文件只放
+这个仓属于 personal 域；本文件只放
 pendle-mcp 的局部约定。
 
 ## 本仓职责
